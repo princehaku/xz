@@ -200,7 +200,9 @@ private:
         if(touch_cfg.disp) {
             lvgl_port_add_touch(&touch_cfg);
         } else {
+#if !CONFIG_USE_EMOTE_MESSAGE_STYLE
             ESP_LOGE(TAG, "Touch display is not initialized");
+#endif
         }
     }
 

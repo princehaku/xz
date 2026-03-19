@@ -138,7 +138,11 @@ void EmoteDisplay::SetEmotion(const char* const emotion)
 {
     ESP_LOGI(TAG, "SetEmotion: %s", emotion);
     if (emote_handle_ && emotion && strlen(emotion) > 0) {
-        emote_set_anim_emoji(emote_handle_, emotion);
+        if (std::strcmp(emotion, "microchip_ai") == 0) {
+            emote_set_anim_emoji(emote_handle_, "neutral");
+        } else {
+            emote_set_anim_emoji(emote_handle_, emotion);
+        }
     }
 }
 

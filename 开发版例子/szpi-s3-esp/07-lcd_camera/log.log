@@ -1,0 +1,80 @@
+ESP-ROM:esp32s3-20210327
+Build:Mar 27 2021
+rst:0xc (RTC_SW_CPU_RST),boot:0xb (SPI_FAST_FLASH_BOOT)
+Saved PC:0x40379e31
+SPIWP:0xee
+mode:DIO, clock div:1
+load:0x3fce2810,len:0x1564
+load:0x403c8700,len:0x4
+load:0x403c8704,len:0xd24
+load:0x403cb700,len:0x2ed4
+entry 0x403c8928
+I (31) boot: ESP-IDF v5.4.3-904-gacd7b505de 2nd stage bootloader
+I (31) boot: compile time Feb  9 2026 10:29:10
+I (31) boot: Multicore bootloader
+I (33) boot: chip revision: v0.2
+I (36) boot: efuse block revision: v1.3
+I (39) boot.esp32s3: Boot SPI Speed : 80MHz
+I (43) boot.esp32s3: SPI Mode       : DIO
+I (47) boot.esp32s3: SPI Flash Size : 16MB
+I (51) boot: Enabling RNG early entropy source...
+I (55) boot: Partition Table:
+I (58) boot: ## Label            Usage          Type ST Offset   Length
+I (64) boot:  0 nvs              WiFi data        01 02 00009000 00006000
+I (71) boot:  1 phy_init         RF data          01 01 0000f000 00001000
+I (77) boot:  2 factory          factory app      00 00 00010000 00100000
+I (84) boot: End of partition table
+I (87) esp_image: segment 0: paddr=00010020 vaddr=3c020020 size=33b20h (211744) map
+I (132) esp_image: segment 1: paddr=00043b48 vaddr=3fc9b500 size=034e0h ( 13536) load
+I (135) esp_image: segment 2: paddr=00047030 vaddr=40378000 size=08fe8h ( 36840) load
+I (144) esp_image: segment 3: paddr=00050020 vaddr=42000020 size=1d200h (119296) map
+I (165) esp_image: segment 4: paddr=0006d228 vaddr=40380fe8 size=0a4dch ( 42204) load
+I (174) esp_image: segment 5: paddr=0007770c vaddr=50000000 size=0001ch (    28) load
+I (182) boot: Loaded app from partition at offset 0x10000
+I (182) boot: Disabling RNG early entropy source...
+I (192) octal_psram: vendor id    : 0x0d (AP)
+I (192) octal_psram: dev id       : 0x02 (generation 3)
+I (193) octal_psram: density      : 0x03 (64 Mbit)
+I (195) octal_psram: good-die     : 0x01 (Pass)
+I (199) octal_psram: Latency      : 0x01 (Fixed)
+I (203) octal_psram: VCC          : 0x01 (3V)
+I (207) octal_psram: SRF          : 0x01 (Fast Refresh)
+I (212) octal_psram: BurstType    : 0x01 (Hybrid Wrap)
+I (217) octal_psram: BurstLen     : 0x01 (32 Byte)
+I (222) octal_psram: Readlatency  : 0x02 (10 cycles@Fixed)
+I (227) octal_psram: DriveStrength: 0x00 (1/1)
+I (232) MSPI Timing: PSRAM timing tuning index: 4
+I (235) esp_psram: Found 8MB PSRAM device
+I (239) esp_psram: Speed: 80MHz
+I (242) cpu_start: Multicore app
+I (543) esp_psram: SPI SRAM memory test OK
+I (552) cpu_start: GPIO 44 and 43 are used as console UART I/O pins
+I (552) cpu_start: Pro cpu start user code
+I (552) cpu_start: cpu freq: 240000000 Hz
+I (554) app_init: Application information:
+I (558) app_init: Project name:     lcd_camera
+I (562) app_init: App version:      1
+I (565) app_init: Compile time:     Feb  9 2026 10:29:05
+I (570) app_init: ELF file SHA256:  96158f67c...
+I (575) app_init: ESP-IDF:          v5.4.3-904-gacd7b505de
+I (580) efuse_init: Min chip rev:     v0.0
+I (584) efuse_init: Max chip rev:     v0.99
+I (588) efuse_init: Chip rev:         v0.2
+I (592) heap_init: Initializing. RAM available for dynamic allocation:
+I (598) heap_init: At 3FC9F3B8 len 0004A358 (296 KiB): RAM
+I (603) heap_init: At 3FCE9710 len 00005724 (21 KiB): RAM
+I (608) heap_init: At 600FE000 len 00001FE8 (7 KiB): RTCRAM
+I (614) esp_psram: Adding pool of 8192K of PSRAM memory to heap allocator
+I (621) spi_flash: detected chip: gd
+I (623) spi_flash: flash io: dio
+E (626) i2c: CONFLICT! driver_ng is not allowed to be used with this old driver
+
+abort() was called at PC 0x42014103 on core 0
+
+
+Backtrace: 0x40379ef1:0x3fceb1c0 0x40381961:0x3fceb1e0 0x40389145:0x3fceb200 0x42014103:0x3fceb270 0x4200281b:0x3fceb290 0x42002902:0x3fceb2b0 0x40379a42:0x3fceb2d0 0x403ccaa0:0x3fceb340 0x403ccedd:0x3fceb380 0x403c8991:0x3fceb4b0 0x40045c01:0x3fceb570 0x40043ab6:0x3fceb6f0 0x40034c45:0x3fceb710
+
+
+
+
+ELF file SHA256: 96158f67c

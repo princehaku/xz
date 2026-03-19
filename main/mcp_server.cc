@@ -96,6 +96,7 @@ void McpServer::AddCommonTools() {
                 return false;
             });
     }
+#endif
 
     auto camera = board.GetCamera();
     if (camera) {
@@ -119,7 +120,6 @@ void McpServer::AddCommonTools() {
                 return camera->Explain(question);
             });
     }
-#endif
 
     // Restore the original tools list to the end of the tools list
     tools_.insert(tools_.end(), original_tools.begin(), original_tools.end());

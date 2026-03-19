@@ -424,6 +424,13 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_margin_left(battery_label_, lvgl_theme->spacing(2), 0);
 
+    sd_card_label_ = lv_label_create(right_icons);
+    lv_label_set_text(sd_card_label_, "");
+    lv_obj_set_style_text_font(sd_card_label_, text_font, 0);
+    lv_obj_set_style_text_color(sd_card_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_margin_left(sd_card_label_, lvgl_theme->spacing(2), 0);
+    lv_obj_add_flag(sd_card_label_, LV_OBJ_FLAG_HIDDEN);
+
     /* Layer 2: Status bar - for center text labels */
     status_bar_ = lv_obj_create(screen);
     lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
@@ -895,6 +902,13 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_margin_left(battery_label_, lvgl_theme->spacing(2), 0);
 
+    sd_card_label_ = lv_label_create(right_icons);
+    lv_label_set_text(sd_card_label_, "");
+    lv_obj_set_style_text_font(sd_card_label_, text_font, 0);
+    lv_obj_set_style_text_color(sd_card_label_, lvgl_theme->text_color(), 0);
+    lv_obj_set_style_margin_left(sd_card_label_, lvgl_theme->spacing(2), 0);
+    lv_obj_add_flag(sd_card_label_, LV_OBJ_FLAG_HIDDEN);
+
     /* Layer 2: Status bar - for center text labels */
     status_bar_ = lv_obj_create(screen);
     lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
@@ -1198,6 +1212,9 @@ void LcdDisplay::SetTheme(Theme* theme) {
     lv_obj_set_style_text_color(notification_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(mute_label_, lvgl_theme->text_color(), 0);
     lv_obj_set_style_text_color(battery_label_, lvgl_theme->text_color(), 0);
+    if (sd_card_label_ != nullptr) {
+        lv_obj_set_style_text_color(sd_card_label_, lvgl_theme->text_color(), 0);
+    }
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
 
     // If we have the chat message style, update all message bubbles

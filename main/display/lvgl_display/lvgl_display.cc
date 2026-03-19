@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <font_awesome.h>
+#include <esp_vfs_fat.h>
 
 #include "lvgl_display.h"
 #include "board.h"
@@ -60,6 +61,9 @@ LvglDisplay::~LvglDisplay() {
     }
     if (battery_label_ != nullptr) {
         lv_obj_del(battery_label_);
+    }
+    if (sd_card_label_ != nullptr) {
+        lv_obj_del(sd_card_label_);
     }
     if( low_battery_popup_ != nullptr ) {
         lv_obj_del(low_battery_popup_);
@@ -216,6 +220,33 @@ void LvglDisplay::UpdateStatusBar(bool update_all) {
     }
 
     esp_pm_lock_release(pm_lock_);
+
+    // Update SD card capacity every 10 seconds (same cadence as network icon)
+    if (update_all || seconds_counter % 10 == 1) {
+        if (sd_card_label_ != nullptr) {
+            uint64_t total_bytes = 0, free_bytes = 0;
+            esp_err_t fat_ret = esp_vfs_fat_info("/sdcard", &total_bytes, &free_bytes);
+            DisplayLockGuard lock(this);
+            if (fat_ret == ESP_OK && total_bytes > 0) {
+                char sd_str[24];
+                float free_gb  = (float)free_bytes  / (1024.0f * 1024.0f * 1024.0f);
+                float total_gb = (float)total_bytes / (1024.0f * 1024.0f * 1024.0f);
+                if (total_gb >= 1.0f) {
+                    snprintf(sd_str, sizeof(sd_str), "%.1f/%.0fG", free_gb, total_gb);
+                } else {
+                    // Smaller cards: show in MB
+                    float free_mb  = (float)free_bytes  / (1024.0f * 1024.0f);
+                    float total_mb = (float)total_bytes / (1024.0f * 1024.0f);
+                    snprintf(sd_str, sizeof(sd_str), "%.0f/%.0fM", free_mb, total_mb);
+                }
+                lv_label_set_text(sd_card_label_, sd_str);
+                lv_obj_remove_flag(sd_card_label_, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                // SD card not mounted or error — hide the label
+                lv_obj_add_flag(sd_card_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
 }
 
 void LvglDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
