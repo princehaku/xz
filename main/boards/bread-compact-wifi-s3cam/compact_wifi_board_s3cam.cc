@@ -220,7 +220,7 @@ private:
 
                 if (display_) {
                     display_->ShowNotification("识图完成");
-                    display_->SetChatMessage("assistant", result.c_str());
+                    // display_->SetChatMessage("assistant", result.c_str());
                 }
 
                 // Ensure app is idle before invoking, otherwise WakeWordInvoke may only abort current speaking.
@@ -236,7 +236,7 @@ private:
                 }
 
                 // Trigger cloud-side voice response so user can hear the description.
-                app.WakeWordInvoke("请你查看当前镜头画面并用中文语音播报结果");
+                app.WakeWordInvoke("请你查看当前镜头画面并用百科全书的模式给我讲讲");
                 voice_invoke_sent = true;
                 LogMemorySnapshot("photo_after_explain");
             } catch (const std::exception& e) {
