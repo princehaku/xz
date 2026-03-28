@@ -109,6 +109,13 @@ void AudioService::Initialize(AudioCodec* codec) {
         }
     });
 
+#if CONFIG_USE_AUDIO_PROCESSOR
+    // Create AFE processing task early to avoid allocation failure later
+    // when entering listening state under fragmented heap conditions.
+    audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
+    audio_processor_initialized_ = true;
+#endif
+
     esp_timer_create_args_t audio_power_timer_args = {
         .callback = [](void* arg) {
             AudioService* audio_service = (AudioService*)arg;
@@ -267,7 +274,16 @@ void AudioService::AudioInputTask() {
 
         /* Feed the wake word and/or audio processor */
         if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
-            int samples = 160; // 10ms
+            // Read audio in AFE feed-chunk aligned size to reduce feed/fetch mismatch.
+            size_t wake_feed = 0;
+            size_t proc_feed = 0;
+            if ((bits & AS_EVENT_WAKE_WORD_RUNNING) && wake_word_) {
+                wake_feed = wake_word_->GetFeedSize();
+            }
+            if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
+                proc_feed = audio_processor_->GetFeedSize();
+            }
+            int samples = static_cast<int>(std::max<size_t>(160, std::max(wake_feed, proc_feed)));
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
@@ -498,7 +514,15 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
         timestamp_queue_.pop_front();
     }
 
-    audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
+    if (audio_encode_queue_.size() >= MAX_ENCODE_TASKS_IN_QUEUE) {
+        if (type == kAudioTaskTypeEncodeToSendQueue) {
+            // Do not block AFE/fetch thread. Drop one oldest frame to keep real-time pipeline alive.
+            audio_encode_queue_.pop_front();
+            ESP_LOGW(TAG, "Encode queue full, dropping oldest frame");
+        } else {
+            audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
+        }
+    }
     audio_encode_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();
 }

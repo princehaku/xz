@@ -332,17 +332,22 @@ void McpServer::ParseMessage(const std::string& message) {
 }
 
 void McpServer::ParseCapabilities(const cJSON* capabilities) {
+    if (!cJSON_IsObject(capabilities)) {
+        return;
+    }
     auto vision = cJSON_GetObjectItem(capabilities, "vision");
     if (cJSON_IsObject(vision)) {
         auto url = cJSON_GetObjectItem(vision, "url");
         auto token = cJSON_GetObjectItem(vision, "token");
-        if (cJSON_IsString(url)) {
+        const char* url_value = cJSON_GetStringValue(url);
+        if (url_value != nullptr && url_value[0] != '\0') {
             auto camera = Board::GetInstance().GetCamera();
             if (camera) {
-                std::string url_str = std::string(url->valuestring);
+                std::string url_str(url_value);
                 std::string token_str;
-                if (cJSON_IsString(token)) {
-                    token_str = std::string(token->valuestring);
+                const char* token_value = cJSON_GetStringValue(token);
+                if (token_value != nullptr) {
+                    token_str.assign(token_value);
                 }
                 camera->SetExplainUrl(url_str, token_str);
             }

@@ -218,10 +218,18 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
+            int send_fail_count = 0;
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
-                    break;
+                    send_fail_count++;
+                    if (send_fail_count >= 3) {
+                        // Avoid tight loop when network stack is under memory pressure.
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                    }
+                    // Drop this frame and continue draining queue to keep real-time pipeline alive.
+                    continue;
                 }
+                send_fail_count = 0;
             }
         }
 

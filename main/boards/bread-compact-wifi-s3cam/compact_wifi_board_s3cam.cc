@@ -16,6 +16,10 @@
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <driver/spi_common.h>
+#include <exception>
+#include <esp_adc/adc_oneshot.h>
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
 
 #if defined(LCD_TYPE_ILI9341_SERIAL)
 #include "esp_lcd_ili9341.h"
@@ -64,8 +68,195 @@ class CompactWifiBoardS3Cam : public WifiBoard {
 private:
  
     Button boot_button_;
-    LcdDisplay* display_;
-    Esp32Camera* camera_;
+    Button change_photo_button_;
+    Button take_photo_button_;
+    Button change_photo_set_button_;
+    LcdDisplay* display_ = nullptr;
+    Esp32Camera* camera_ = nullptr;
+    adc_oneshot_unit_handle_t battery_adc_handle_ = nullptr;
+    bool battery_adc_ready_ = false;
+    esp_timer_handle_t memory_snapshot_timer_ = nullptr;
+    int photo_mode_index_ = 0;
+    int photo_set_index_ = 0;
+    bool photo_task_running_ = false;
+
+    static const char* DeviceStateToString(DeviceState state) {
+        switch (state) {
+            case kDeviceStateUnknown: return "unknown";
+            case kDeviceStateStarting: return "starting";
+            case kDeviceStateWifiConfiguring: return "wifi_configuring";
+            case kDeviceStateIdle: return "idle";
+            case kDeviceStateConnecting: return "connecting";
+            case kDeviceStateListening: return "listening";
+            case kDeviceStateSpeaking: return "speaking";
+            case kDeviceStateUpgrading: return "upgrading";
+            case kDeviceStateActivating: return "activating";
+            default: return "other";
+        }
+    }
+
+    void LogMemorySnapshot(const char* stage) {
+        const size_t heap_free = esp_get_free_heap_size();
+        const size_t heap_min = esp_get_minimum_free_heap_size();
+        const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        const DeviceState state = Application::GetInstance().GetDeviceState();
+        ESP_LOGI("MEM", "[%s] state=%s heap=%u heap_min=%u int=%u int_largest=%u psram=%u psram_largest=%u",
+            stage,
+            DeviceStateToString(state),
+            (unsigned)heap_free,
+            (unsigned)heap_min,
+            (unsigned)internal_free,
+            (unsigned)internal_largest,
+            (unsigned)psram_free,
+            (unsigned)psram_largest);
+    }
+
+    static void MemorySnapshotTimerCallback(void* arg) {
+        auto* board = static_cast<CompactWifiBoardS3Cam*>(arg);
+        if (board == nullptr) {
+            return;
+        }
+        board->LogMemorySnapshot("periodic_5s");
+    }
+
+    void StartMemorySnapshotTimer() {
+        if (memory_snapshot_timer_ != nullptr) {
+            return;
+        }
+        const esp_timer_create_args_t timer_args = {
+            .callback = &CompactWifiBoardS3Cam::MemorySnapshotTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "mem_probe_5s",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&timer_args, &memory_snapshot_timer_) != ESP_OK) {
+            ESP_LOGW(TAG, "Create memory snapshot timer failed");
+            return;
+        }
+        if (esp_timer_start_periodic(memory_snapshot_timer_, 5 * 1000 * 1000) != ESP_OK) {
+            ESP_LOGW(TAG, "Start memory snapshot timer failed");
+            esp_timer_delete(memory_snapshot_timer_);
+            memory_snapshot_timer_ = nullptr;
+            return;
+        }
+        LogMemorySnapshot("timer_started");
+    }
+
+    const char* GetPhotoModeName() const {
+        static const char* kModeNames[] = {"百科识图"};
+        constexpr size_t kModeCount = sizeof(kModeNames) / sizeof(kModeNames[0]);
+        return kModeNames[photo_mode_index_ % kModeCount];
+    }
+
+    std::string BuildPhotoQuestion() const {
+        static const char* kModeQuestions[] = {
+            "请识别这张图片中的主要内容，并用中文+中文百科的方式简要说明。请尽可能之别这张图片中的关键物体。"
+        };
+        static const char* kSetHints[] = {
+            "回答尽量简短，给出关键细节，控制在100字以内。"
+        };
+        constexpr size_t kModeCount = sizeof(kModeQuestions) / sizeof(kModeQuestions[0]);
+        constexpr size_t kSetCount = sizeof(kSetHints) / sizeof(kSetHints[0]);
+        return std::string(kModeQuestions[photo_mode_index_ % kModeCount]) + " " + kSetHints[photo_set_index_ % kSetCount];
+    }
+
+    void CaptureAndExplainPhoto() {
+        LogMemorySnapshot("photo_enter");
+        if (photo_task_running_) {
+            if (display_) {
+                display_->ShowNotification("拍照任务进行中");
+            }
+            return;
+        }
+        photo_task_running_ = true;
+
+        auto& app = Application::GetInstance();
+        app.Schedule([this]() {
+            auto reset_busy = [this]() {
+                photo_task_running_ = false;
+            };
+            auto& app = Application::GetInstance();
+            DeviceState state_before_photo = app.GetDeviceState();
+            bool voice_invoke_sent = false;
+
+            // Pause voice pipeline before camera upload to avoid AFE/UDP contention.
+            if (state_before_photo == kDeviceStateListening || state_before_photo == kDeviceStateConnecting) {
+                app.StopListening();
+                vTaskDelay(pdMS_TO_TICKS(120));
+                LogMemorySnapshot("photo_after_stop_listening");
+            }
+
+            if (camera_ == nullptr) {
+                ESP_LOGE(TAG, "Camera is not initialized");
+                if (display_) {
+                    display_->ShowNotification("摄像头未初始化");
+                }
+                reset_busy();
+                return;
+            }
+
+            if (display_) {
+                display_->ShowNotification("拍照中...");
+            }
+
+            if (!camera_->Capture()) {
+                ESP_LOGE(TAG, "Camera capture failed");
+                if (display_) {
+                    display_->ShowNotification("拍照失败");
+                }
+                reset_busy();
+                return;
+            }
+
+            try {
+                LogMemorySnapshot("photo_before_explain");
+                std::string question = BuildPhotoQuestion();
+                std::string result = camera_->Explain(question);
+                ESP_LOGI(TAG, "Photo explain result: %s", result.c_str());
+
+                if (display_) {
+                    display_->ShowNotification("识图完成");
+                    display_->SetChatMessage("assistant", result.c_str());
+                }
+
+                // Ensure app is idle before invoking, otherwise WakeWordInvoke may only abort current speaking.
+                DeviceState state_now = app.GetDeviceState();
+                if (state_now == kDeviceStateSpeaking) {
+                    app.ToggleChatState();
+                    vTaskDelay(pdMS_TO_TICKS(120));
+                    state_now = app.GetDeviceState();
+                }
+                if (state_now == kDeviceStateListening || state_now == kDeviceStateConnecting) {
+                    app.StopListening();
+                    vTaskDelay(pdMS_TO_TICKS(120));
+                }
+
+                // Trigger cloud-side voice response so user can hear the description.
+                app.WakeWordInvoke("请你查看当前镜头画面并用中文语音播报结果");
+                voice_invoke_sent = true;
+                LogMemorySnapshot("photo_after_explain");
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "Photo explain failed: %s", e.what());
+                if (display_) {
+                    display_->ShowNotification("后端识图失败");
+                }
+            }
+
+            // Restore listening only if no voice invoke was sent.
+            // Otherwise StartListening may interrupt the just-triggered TTS response.
+            if (state_before_photo == kDeviceStateListening && !voice_invoke_sent) {
+                app.StartListening();
+                LogMemorySnapshot("photo_after_resume_listening");
+            }
+
+            LogMemorySnapshot("photo_exit");
+            reset_busy();
+        });
+    }
 
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
@@ -145,13 +336,16 @@ private:
         config.pin_reset = CAMERA_PIN_RESET;
         config.xclk_freq_hz = XCLK_FREQ_HZ;
         config.pixel_format = PIXFORMAT_RGB565;
-        config.frame_size = FRAMESIZE_VGA;
+        // Keep framebuffer small to avoid DRAM allocation failure on this board.
+        config.frame_size = FRAMESIZE_QQVGA;
         config.jpeg_quality = 12;
         config.fb_count = 1;
         config.fb_location = CAMERA_FB_IN_PSRAM;
         config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
         camera_ = new Esp32Camera(config);
-        camera_->SetHMirror(false);
+        camera_->SetHMirror(CAMERA_HMIRROR);
+        camera_->SetVFlip(CAMERA_VFLIP);
+        camera_->SetPreviewRotation(CAMERA_PREVIEW_ROTATE_90, CAMERA_PREVIEW_ROTATE_CW);
     }
 
     void InitializeButtons() {
@@ -163,15 +357,67 @@ private:
             }
             app.ToggleChatState();
         });
+
+        change_photo_button_.OnClick([this]() {
+            photo_mode_index_++;
+            ESP_LOGI(TAG, "Photo mode switched to: %s", GetPhotoModeName());
+            if (display_) {
+                display_->ShowNotification(std::string("拍照模式: ") + GetPhotoModeName());
+            }
+        });
+
+        change_photo_set_button_.OnClick([this]() {
+            photo_set_index_++;
+            ESP_LOGI(TAG, "Photo set switched to: %d", photo_set_index_);
+            if (display_) {
+                display_->ShowNotification(photo_set_index_ == 0 ? "回答风格: 简短" : "回答风格: 详细");
+            }
+        });
+
+        take_photo_button_.OnClick([this]() {
+            CaptureAndExplainPhoto();
+        });
+    }
+
+    void InitializeBatteryMonitor() {
+        adc_oneshot_unit_init_cfg_t unit_cfg = {};
+        unit_cfg.unit_id = POWER_ADC_UNIT;
+        unit_cfg.ulp_mode = ADC_ULP_MODE_DISABLE;
+        if (adc_oneshot_new_unit(&unit_cfg, &battery_adc_handle_) != ESP_OK) {
+            ESP_LOGW(TAG, "Battery ADC unit init failed");
+            return;
+        }
+        adc_oneshot_chan_cfg_t chan_cfg = {};
+        chan_cfg.atten = ADC_ATTEN_DB_12;
+        chan_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
+        if (adc_oneshot_config_channel(battery_adc_handle_, POWER_ADC_CHANNEL, &chan_cfg) != ESP_OK) {
+            ESP_LOGW(TAG, "Battery ADC channel config failed");
+            adc_oneshot_del_unit(battery_adc_handle_);
+            battery_adc_handle_ = nullptr;
+            return;
+        }
+        battery_adc_ready_ = true;
     }
 
 public:
     CompactWifiBoardS3Cam() :
-        boot_button_(BOOT_BUTTON_GPIO) {
+        boot_button_(BOOT_BUTTON_GPIO),
+        change_photo_button_(CHANGE_PHTOT_GPIO),
+        take_photo_button_(TAKE_PHOTO),
+        change_photo_set_button_(CHANGE_PHOTO_SET) {
+        LogMemorySnapshot("boot_enter");
         InitializeSpi();
+        LogMemorySnapshot("after_spi");
         InitializeLcdDisplay();
+        display_->SetPreviewHold(true);
+        LogMemorySnapshot("after_display");
+        InitializeBatteryMonitor();
+        LogMemorySnapshot("after_battery");
         InitializeButtons();
+        LogMemorySnapshot("after_buttons");
         InitializeCamera();
+        LogMemorySnapshot("after_camera");
+        StartMemorySnapshotTimer();
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
             GetBacklight()->RestoreBrightness();
         }
@@ -208,6 +454,32 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (!battery_adc_ready_ || battery_adc_handle_ == nullptr) {
+            return false;
+        }
+        int sum = 0;
+        constexpr int kSamples = 8;
+        for (int i = 0; i < kSamples; ++i) {
+            int raw = 0;
+            if (adc_oneshot_read(battery_adc_handle_, POWER_ADC_CHANNEL, &raw) != ESP_OK) {
+                return false;
+            }
+            sum += raw;
+        }
+        int avg = sum / kSamples;
+        // Empirical raw range for 1:1 divider and Li-ion battery on ESP32-S3 ADC.
+        constexpr int kRawEmpty = 1700;
+        constexpr int kRawFull = 2500;
+        int pct = (avg - kRawEmpty) * 100 / (kRawFull - kRawEmpty);
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        level = pct;
+        charging = false;
+        discharging = true;
+        return true;
     }
 };
 

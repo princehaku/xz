@@ -190,9 +190,21 @@ bool MqttProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
 }
 
 void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
+    if (audio_channel_closing_.exchange(true)) {
+        ESP_LOGW(TAG, "Audio channel close already in progress");
+        return;
+    }
+
+    bool had_udp = false;
     {
         std::lock_guard<std::mutex> lock(channel_mutex_);
+        had_udp = (udp_ != nullptr);
         udp_.reset();
+    }
+
+    if (!had_udp) {
+        audio_channel_closing_.store(false);
+        return;
     }
 
     ESP_LOGI(TAG, "Closing audio channel, send_goodbye: %d", send_goodbye);
@@ -210,6 +222,7 @@ void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
     if (on_audio_channel_closed_ != nullptr) {
         on_audio_channel_closed_();
     }
+    audio_channel_closing_.store(false);
 }
 
 bool MqttProtocol::OpenAudioChannel() {

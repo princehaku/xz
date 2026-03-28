@@ -11,6 +11,11 @@ AfeAudioProcessor::AfeAudioProcessor()
 }
 
 void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) {
+    if (processor_task_handle_ != nullptr) {
+        ESP_LOGW(TAG, "Audio processor task already initialized");
+        return;
+    }
+
     codec_ = codec;
     frame_samples_ = frame_duration_ms * 16000 / 1000;
 
@@ -27,15 +32,17 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
         input_format.push_back('R');
     }
 
-    srmodel_list_t *models;
-    if (models_list == nullptr) {
-        models = esp_srmodel_init("model");
+    // Scheme B: run without local srmodels partition dependency.
+    // If models are not preloaded from assets, keep AFE on built-in/basic path.
+    srmodel_list_t *models = models_list;
+    char* ns_model_name = nullptr;
+    char* vad_model_name = nullptr;
+    if (models != nullptr) {
+        ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
+        vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     } else {
-        models = models_list;
+        ESP_LOGW(TAG, "No local speech models loaded; AFE runs without NS/VAD model files");
     }
-
-    char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
-    char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
@@ -55,6 +62,8 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 
     afe_config->agc_init = false;
     afe_config->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
+    afe_config->afe_perferred_core = 1;
+    afe_config->afe_perferred_priority = 3;
 
 #ifdef CONFIG_USE_DEVICE_AEC
     afe_config->aec_init = true;
@@ -65,13 +74,34 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
 #endif
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
+    if (afe_iface_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create AFE interface");
+        return;
+    }
     afe_data_ = afe_iface_->create_from_config(afe_config);
+    if (afe_data_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create AFE runtime data");
+        return;
+    }
     
-    xTaskCreate([](void* arg) {
+    BaseType_t task_created = xTaskCreatePinnedToCore([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
         this_->AudioProcessorTask();
         vTaskDelete(NULL);
-    }, "audio_communication", 4096, this, 3, NULL);
+    }, "audio_communication", 2816, this, 3, &processor_task_handle_, 1);
+
+    if (task_created != pdPASS) {
+        ESP_LOGW(TAG, "Create pinned audio_communication task failed, fallback to default core");
+        task_created = xTaskCreate([](void* arg) {
+            auto this_ = (AfeAudioProcessor*)arg;
+            this_->AudioProcessorTask();
+            vTaskDelete(NULL);
+        }, "audio_communication", 2816, this, 3, &processor_task_handle_);
+        if (task_created != pdPASS) {
+            ESP_LOGE(TAG, "Create audio_communication task failed");
+            processor_task_handle_ = nullptr;
+        }
+    }
 }
 
 AfeAudioProcessor::~AfeAudioProcessor() {

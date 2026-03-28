@@ -24,6 +24,8 @@ class Esp32Camera : public Camera
 private:
     bool streaming_on_ = false;
     bool swap_bytes_enabled_ = true;  // Swap pixel byte order for RGB565, enabled by default
+    bool preview_rotate_90_enabled_ = false;
+    bool preview_rotate_clockwise_ = true;
     std::string explain_url_;
     std::string explain_token_;
     std::thread encoder_thread_;
@@ -40,5 +42,6 @@ public:
     virtual bool SetHMirror(bool enabled) override;
     virtual bool SetVFlip(bool enabled) override;
     virtual bool SetSwapBytes(bool enabled) override;
+    void SetPreviewRotation(bool rotate_90, bool clockwise);
     virtual std::string Explain(const std::string &question) override;
 };

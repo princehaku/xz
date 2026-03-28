@@ -34,6 +34,7 @@ protected:
     lv_obj_t* chat_message_label_ = nullptr;
     esp_timer_handle_t preview_timer_ = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
+    bool preview_hold_ = false;
     bool hide_subtitle_ = false;  // Control whether to hide chat messages/subtitles
 
     void InitializeLcdThemes();
@@ -56,6 +57,8 @@ public:
     
     // Set whether to hide chat messages/subtitles
     void SetHideSubtitle(bool hide);
+    // Keep preview image on screen without auto-hide timer
+    void SetPreviewHold(bool hold);
 };
 
 // SPI LCD display

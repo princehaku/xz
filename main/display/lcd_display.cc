@@ -79,6 +79,9 @@ LcdDisplay::LcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_handle_
     esp_timer_create_args_t preview_timer_args = {
         .callback = [](void* arg) {
             LcdDisplay* display = static_cast<LcdDisplay*>(arg);
+            if (display->preview_hold_) {
+                return;
+            }
             display->SetPreviewImage(nullptr);
         },
         .arg = this,
@@ -1040,8 +1043,10 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
     }
     lv_obj_add_flag(emoji_box_, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
-    esp_timer_stop(preview_timer_);
-    ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
+    if (!preview_hold_) {
+        esp_timer_stop(preview_timer_);
+        ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
+    }
 }
 
 void LcdDisplay::SetChatMessage(const char* role, const char* content) {
@@ -1325,5 +1330,15 @@ void LcdDisplay::SetHideSubtitle(bool hide) {
                 lv_obj_remove_flag(bottom_bar_, LV_OBJ_FLAG_HIDDEN);
             }
         }
+    }
+}
+
+void LcdDisplay::SetPreviewHold(bool hold) {
+    preview_hold_ = hold;
+    if (preview_hold_) {
+        esp_timer_stop(preview_timer_);
+    } else if (preview_image_cached_ != nullptr) {
+        esp_timer_stop(preview_timer_);
+        ESP_ERROR_CHECK(esp_timer_start_once(preview_timer_, PREVIEW_IMAGE_DURATION_MS * 1000));
     }
 }

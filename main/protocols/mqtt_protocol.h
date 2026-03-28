@@ -43,6 +43,7 @@ private:
     std::string publish_topic_;
 
     std::mutex channel_mutex_;
+    std::atomic<bool> audio_channel_closing_{false};
     std::unique_ptr<Mqtt> mqtt_;
     std::unique_ptr<Udp> udp_;
     mbedtls_aes_context aes_ctx_;
