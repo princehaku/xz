@@ -423,62 +423,72 @@ void AudioService::OpusCodecTask() {
         }
         /* Encode the audio to send queue */
         if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
-            auto task = std::move(audio_encode_queue_.front());
-            audio_encode_queue_.pop_front();
-            audio_queue_cv_.notify_all();
-            lock.unlock();
-
-            auto packet = std::make_unique<AudioStreamPacket>();
-            packet->frame_duration = OPUS_FRAME_DURATION_MS;
-            packet->sample_rate = 16000;
-            packet->timestamp = task->timestamp;
-
-            if (opus_encoder_ != nullptr && task->pcm.size() == encoder_frame_size_) {
-                std::vector<uint8_t> buf(encoder_outbuf_size_);
-                esp_audio_enc_in_frame_t in = {
-                    .buffer = (uint8_t *)(task->pcm.data()),
-                    .len = (uint32_t)(encoder_frame_size_ * sizeof(int16_t)),
-                };
-                esp_audio_enc_out_frame_t out = {
-                    .buffer = buf.data(),
-                    .len = (uint32_t)encoder_outbuf_size_,
-                    .encoded_bytes = 0,
-                };
-                auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
-                if (ret == ESP_AUDIO_ERR_OK) {
-                    packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
-                    static uint32_t encode_count = 0;
-                    encode_count++;
-                    if (encode_count == 1 || encode_count % 50 == 0) {
-                        ESP_LOGI(TAG, "Opus encoded #%lu: pcm=%u bytes=%u",
-                                 (unsigned long)encode_count,
-                                 (unsigned)encoder_frame_size_,
-                                 (unsigned)out.encoded_bytes);
-                    }
-
-                    if (task->type == kAudioTaskTypeEncodeToSendQueue) {
-                        {
-                            std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                            audio_send_queue_.push_back(std::move(packet));
-                        }
-                        if (callbacks_.on_send_queue_available) {
-                            callbacks_.on_send_queue_available();
-                        }
-                    } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
-                        std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                        audio_testing_queue_.push_back(std::move(packet));
-                    }
-                    debug_statistics_.encode_count++;
-                } else {
-                    ESP_LOGE(TAG, "Failed to encode audio, error code: %d", ret);
-                }
+            /* Software echo suppression: discard mic audio while TTS is playing or
+             * queued for playback.  This prevents the speaker output from feeding
+             * back into the ASR pipeline when AEC hardware reference is unavailable. */
+            bool tts_active = !audio_playback_queue_.empty() || !audio_decode_queue_.empty();
+            if (tts_active) {
+                audio_encode_queue_.pop_front();
+                audio_queue_cv_.notify_all();
+                /* lock still held – continue to next loop iteration */
             } else {
-                ESP_LOGE(TAG, "Failed to encode audio: encoder not configured or invalid frame size (got %u, expected %u)",
-                         task->pcm.size(), encoder_frame_size_);
-            }
-            lock.lock();
-        }
-    }
+                auto task = std::move(audio_encode_queue_.front());
+                audio_encode_queue_.pop_front();
+                audio_queue_cv_.notify_all();
+                lock.unlock();
+
+                auto packet = std::make_unique<AudioStreamPacket>();
+                packet->frame_duration = OPUS_FRAME_DURATION_MS;
+                packet->sample_rate = 16000;
+                packet->timestamp = task->timestamp;
+
+                if (opus_encoder_ != nullptr && task->pcm.size() == encoder_frame_size_) {
+                    std::vector<uint8_t> buf(encoder_outbuf_size_);
+                    esp_audio_enc_in_frame_t in = {
+                        .buffer = (uint8_t *)(task->pcm.data()),
+                        .len = (uint32_t)(encoder_frame_size_ * sizeof(int16_t)),
+                    };
+                    esp_audio_enc_out_frame_t out = {
+                        .buffer = buf.data(),
+                        .len = (uint32_t)encoder_outbuf_size_,
+                        .encoded_bytes = 0,
+                    };
+                    auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
+                    if (ret == ESP_AUDIO_ERR_OK) {
+                        packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
+                        static uint32_t encode_count = 0;
+                        encode_count++;
+                        if (encode_count == 1 || encode_count % 50 == 0) {
+                            ESP_LOGI(TAG, "Opus encoded #%lu: pcm=%u bytes=%u",
+                                     (unsigned long)encode_count,
+                                     (unsigned)encoder_frame_size_,
+                                     (unsigned)out.encoded_bytes);
+                        }
+
+                        if (task->type == kAudioTaskTypeEncodeToSendQueue) {
+                            {
+                                std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                                audio_send_queue_.push_back(std::move(packet));
+                            }
+                            if (callbacks_.on_send_queue_available) {
+                                callbacks_.on_send_queue_available();
+                            }
+                        } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
+                            std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
+                            audio_testing_queue_.push_back(std::move(packet));
+                        }
+                        debug_statistics_.encode_count++;
+                    } else {
+                        ESP_LOGE(TAG, "Failed to encode audio, error code: %d", ret);
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Failed to encode audio: encoder not configured or invalid frame size (got %u, expected %u)",
+                             task->pcm.size(), encoder_frame_size_);
+                }
+                lock.lock();
+            } /* else (not tts_active) */
+        } /* if encode_queue non-empty */
+    } /* while */
 
     ESP_LOGW(TAG, "Opus codec task stopped");
 }
