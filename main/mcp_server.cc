@@ -350,6 +350,9 @@ void McpServer::ParseCapabilities(const cJSON* capabilities) {
                     token_str.assign(token_value);
                 }
                 camera->SetExplainUrl(url_str, token_str);
+                Settings camera_settings("camera", true);
+                camera_settings.SetString("explain_url", url_str);
+                camera_settings.SetString("explain_token", token_str);
             }
         }
     }

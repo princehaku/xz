@@ -6,6 +6,7 @@
 #include "button.h"
 #include "config.h"
 #include "mcp_server.h"
+#include "settings.h"
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "esp32_camera.h"
@@ -232,14 +233,13 @@ private:
 
                 if (display_) {
                     display_->ShowNotification("识图完成");
-                    // display_->SetChatMessage("assistant", result.c_str());
-                }
-
-                // Do not use WakeWordInvoke for long text prompts; protocol detects wake words only.
-                // Keep result on screen and let user ask follow-up naturally.
-                if (display_) {
                     display_->SetChatMessage("assistant", result.c_str());
                 }
+
+                // 使用 NotifySTT 代替手动构造 JSON，确保连接状态正确处理
+                std::string fake_user_command = "我拍了一张照片，内容是：" + result + "。请用短句向我介绍一下。";
+                app.NotifySTT(fake_user_command);
+
                 LogMemorySnapshot("photo_after_explain");
             } catch (const std::exception& e) {
                 ESP_LOGE(TAG, "Photo explain failed: %s", e.what());
@@ -347,6 +347,18 @@ private:
         camera_->SetHMirror(CAMERA_HMIRROR);
         camera_->SetVFlip(CAMERA_VFLIP);
         camera_->SetPreviewRotation(CAMERA_PREVIEW_ROTATE_90, CAMERA_PREVIEW_ROTATE_CW);
+
+        // Restore persisted image-explain endpoint in case current MCP session doesn't resend vision capabilities.
+        Settings camera_settings("camera", false);
+        std::string explain_url = camera_settings.GetString("explain_url");
+        std::string explain_token = camera_settings.GetString("explain_token");
+        if (explain_url.empty()) {
+            explain_url = CAMERA_EXPLAIN_URL_DEFAULT;
+            ESP_LOGI(TAG, "Using default camera explain endpoint");
+        } else {
+            ESP_LOGI(TAG, "Loaded persisted camera explain endpoint");
+        }
+        camera_->SetExplainUrl(explain_url, explain_token);
     }
 
     void InitializeButtons() {
@@ -376,7 +388,12 @@ private:
         });
 
         take_photo_button_.OnClick([this]() {
-            CaptureAndExplainPhoto();
+            if (display_) {
+                display_->ShowNotification("已发送拍照请求");
+            }
+            auto& app = Application::GetInstance();
+            // Simulate a user utterance so cloud side can trigger camera tool flow.
+            app.NotifySTT("帮我拍照并用中英百科解释");
         });
     }
 
@@ -419,6 +436,8 @@ public:
         InitializeCamera();
         LogMemorySnapshot("after_camera");
         StartMemorySnapshotTimer();
+        // Raise default speaker volume for this board.
+        GetAudioCodec()->SetOutputVolume(90);
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
             GetBacklight()->RestoreBrightness();
         }

@@ -4,7 +4,7 @@
 #include <driver/gpio.h>
 
 #define AUDIO_INPUT_SAMPLE_RATE  16000
-#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
 
 // 如果使用 Duplex I2S 模式，请注释下面一行
 #define AUDIO_I2S_METHOD_SIMPLEX
@@ -60,6 +60,8 @@
 #define CAMERA_VFLIP false
 #define CAMERA_PREVIEW_ROTATE_90 true
 #define CAMERA_PREVIEW_ROTATE_CW true
+// Default vision endpoint fallback (used when MCP capabilities don't provide vision.url)
+#define CAMERA_EXPLAIN_URL_DEFAULT "https://esp-ai.bytegallop.com/mcp/vision/explain"
 
 
 #define DISPLAY_BACKLIGHT_PIN GPIO_NUM_38
