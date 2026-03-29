@@ -112,6 +112,8 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    Protocol* GetProtocol() { return protocol_.get(); }
+    void NotifySTT(const std::string& text);
     
     /**
      * Reset protocol resources (thread-safe)
@@ -142,6 +144,7 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+    std::string pending_stt_text_;
 
 
     // Event handlers
