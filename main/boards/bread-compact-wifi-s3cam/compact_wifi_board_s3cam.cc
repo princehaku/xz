@@ -181,13 +181,25 @@ private:
             };
             auto& app = Application::GetInstance();
             DeviceState state_before_photo = app.GetDeviceState();
-            bool voice_invoke_sent = false;
 
-            // Pause voice pipeline before camera upload to avoid AFE/UDP contention.
-            if (state_before_photo == kDeviceStateListening || state_before_photo == kDeviceStateConnecting) {
-                app.StopListening();
-                vTaskDelay(pdMS_TO_TICKS(120));
-                LogMemorySnapshot("photo_after_stop_listening");
+            // Quiesce voice pipeline before camera upload to avoid AFE/UDP contention.
+            // StopListening() posts an event; here we are already in scheduled main-task code,
+            // so force transition to idle directly to stop voice processing immediately.
+            if (state_before_photo == kDeviceStateSpeaking) {
+                app.AbortSpeaking(kAbortReasonNone);
+                vTaskDelay(pdMS_TO_TICKS(80));
+            }
+            if (state_before_photo == kDeviceStateListening ||
+                state_before_photo == kDeviceStateConnecting ||
+                state_before_photo == kDeviceStateSpeaking) {
+                app.SetDeviceState(kDeviceStateIdle);
+                for (int i = 0; i < 10; ++i) {
+                    if (app.GetDeviceState() == kDeviceStateIdle) {
+                        break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+                LogMemorySnapshot("photo_after_quiesce");
             }
 
             if (camera_ == nullptr) {
@@ -223,21 +235,11 @@ private:
                     // display_->SetChatMessage("assistant", result.c_str());
                 }
 
-                // Ensure app is idle before invoking, otherwise WakeWordInvoke may only abort current speaking.
-                DeviceState state_now = app.GetDeviceState();
-                if (state_now == kDeviceStateSpeaking) {
-                    app.ToggleChatState();
-                    vTaskDelay(pdMS_TO_TICKS(120));
-                    state_now = app.GetDeviceState();
+                // Do not use WakeWordInvoke for long text prompts; protocol detects wake words only.
+                // Keep result on screen and let user ask follow-up naturally.
+                if (display_) {
+                    display_->SetChatMessage("assistant", result.c_str());
                 }
-                if (state_now == kDeviceStateListening || state_now == kDeviceStateConnecting) {
-                    app.StopListening();
-                    vTaskDelay(pdMS_TO_TICKS(120));
-                }
-
-                // Trigger cloud-side voice response so user can hear the description.
-                app.WakeWordInvoke("请你查看当前镜头画面并用百科全书的模式给我讲讲");
-                voice_invoke_sent = true;
                 LogMemorySnapshot("photo_after_explain");
             } catch (const std::exception& e) {
                 ESP_LOGE(TAG, "Photo explain failed: %s", e.what());
@@ -246,9 +248,8 @@ private:
                 }
             }
 
-            // Restore listening only if no voice invoke was sent.
-            // Otherwise StartListening may interrupt the just-triggered TTS response.
-            if (state_before_photo == kDeviceStateListening && !voice_invoke_sent) {
+            // Restore listening state after photo pipeline completes.
+            if (state_before_photo == kDeviceStateListening) {
                 app.StartListening();
                 LogMemorySnapshot("photo_after_resume_listening");
             }
