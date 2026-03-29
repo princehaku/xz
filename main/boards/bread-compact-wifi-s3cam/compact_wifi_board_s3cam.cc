@@ -436,8 +436,8 @@ public:
         InitializeCamera();
         LogMemorySnapshot("after_camera");
         StartMemorySnapshotTimer();
-        // Raise default speaker volume for this board.
-        GetAudioCodec()->SetOutputVolume(90);
+        // Use full-scale software volume by default for this board.
+        GetAudioCodec()->SetOutputVolume(100);
         if (DISPLAY_BACKLIGHT_PIN != GPIO_NUM_NC) {
             GetBacklight()->RestoreBrightness();
         }

@@ -117,7 +117,33 @@ void McpServer::AddCommonTools() {
                     throw std::runtime_error("Failed to capture photo");
                 }
                 auto question = properties["question"].value<std::string>();
-                return camera->Explain(question);
+
+                // This handler runs in the main task (via app.Schedule).
+                // camera->Explain() makes a blocking HTTP/TLS request that can take
+                // several seconds.  During that time the main task cannot drain the
+                // audio send queue, so the encode queue fills and the WebSocket TLS
+                // send buffer saturates, degrading the connection.
+                // Pausing voice processing prevents new audio frames from accumulating
+                // and eliminates the concurrent-TLS memory pressure.
+                auto& app = Application::GetInstance();
+                auto& audio = app.GetAudioService();
+                const bool was_processing = audio.IsAudioProcessorRunning();
+                if (was_processing) {
+                    audio.EnableVoiceProcessing(false);
+                }
+                ReturnValue result;
+                try {
+                    result = camera->Explain(question);
+                } catch (...) {
+                    if (was_processing) {
+                        audio.EnableVoiceProcessing(true);
+                    }
+                    throw;
+                }
+                if (was_processing) {
+                    audio.EnableVoiceProcessing(true);
+                }
+                return result;
             });
     }
 
