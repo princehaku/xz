@@ -515,6 +515,12 @@ void Application::InitializeProtocol() {
             ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
                 protocol_->server_sample_rate(), codec->output_sample_rate());
         }
+
+        if (!pending_stt_text_.empty()) {
+            ESP_LOGI(TAG, "Sending pending STT text: %s", pending_stt_text_.c_str());
+            protocol_->SendWakeWordDetected(pending_stt_text_);
+            pending_stt_text_.clear();
+        }
     });
     
     protocol_->OnAudioChannelClosed([this, &board]() {
@@ -1122,6 +1128,22 @@ void Application::ResetProtocol() {
         }
         // Reset protocol
         protocol_.reset();
+    });
+}
+
+void Application::NotifySTT(const std::string& text) {
+    Schedule([this, text]() {
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            ESP_LOGI(TAG, "Sending STT text: %s", text.c_str());
+            protocol_->SendWakeWordDetected(text);
+        } else {
+            ESP_LOGI(TAG, "Pending STT text: %s", text.c_str());
+            pending_stt_text_ = text;
+            if (GetDeviceState() == kDeviceStateIdle) {
+                SetDeviceState(kDeviceStateConnecting);
+                ContinueOpenAudioChannel(GetDefaultListeningMode());
+            }
+        }
     });
 }
 
