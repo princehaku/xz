@@ -81,7 +81,9 @@ void Protocol::SendStartListening(ListeningMode mode) {
         message += ",\"mode\":\"manual\"";
     }
     message += "}";
-    SendText(message);
+    ESP_LOGI(TAG, "SendStartListening: %s", message.c_str());
+    bool ok = SendText(message);
+    ESP_LOGI(TAG, "SendStartListening result: %s", ok ? "OK" : "FAILED");
 }
 
 void Protocol::SendStopListening() {

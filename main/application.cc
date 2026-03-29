@@ -732,6 +732,11 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 
     if (!protocol_->IsAudioChannelOpened()) {
         if (!protocol_->OpenAudioChannel()) {
+            // OpenAudioChannel() may call SetError (→ OnNetworkError → idle+alert),
+            // but if it fails silently (e.g. CreateWebSocket returns null), recover here.
+            if (GetDeviceState() == kDeviceStateConnecting) {
+                SetDeviceState(kDeviceStateIdle);
+            }
             return;
         }
     }
@@ -962,7 +967,11 @@ void Application::SetListeningMode(ListeningMode mode) {
 }
 
 ListeningMode Application::GetDefaultListeningMode() const {
-    return aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime;
+    // kListeningModeAutoStop relies on server-side VAD which may not trigger on this server.
+    // kListeningModeManualStop: device button-press sends stop, server then runs ASR.
+    // kListeningModeRealtime: server sends continuous partial STT as audio flows.
+    // Try realtime mode so server processes audio continuously without waiting for silence.
+    return kListeningModeRealtime;
 }
 
 void Application::Reboot() {

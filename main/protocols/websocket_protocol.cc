@@ -70,11 +70,18 @@ bool WebsocketProtocol::SendAudio(std::unique_ptr<AudioStreamPacket> packet) {
         return false;
     }
 
+    static uint32_t sent_audio_count = 0;
+    sent_audio_count++;
+    if (sent_audio_count == 1 || sent_audio_count % 50 == 0) {
+        ESP_LOGI(TAG, "Audio sent to server #%lu (payload=%u bytes)",
+                 (unsigned long)sent_audio_count, (unsigned)packet->payload.size());
+    }
     return true;
 }
 
 bool WebsocketProtocol::SendText(const std::string& text) {
     if (websocket_ == nullptr || !websocket_->IsConnected()) {
+        ESP_LOGE(TAG, "SendText failed: websocket not connected, text=%s", text.c_str());
         return false;
     }
 
@@ -84,6 +91,7 @@ bool WebsocketProtocol::SendText(const std::string& text) {
         return false;
     }
 
+    ESP_LOGI(TAG, "Sent text: %s", text.c_str());
     return true;
 }
 
@@ -169,6 +177,7 @@ bool WebsocketProtocol::OpenAudioChannel() {
                 if (strcmp(type->valuestring, "hello") == 0) {
                     ParseServerHello(root);
                 } else {
+                    ESP_LOGI(TAG, "Server JSON type=%s", type->valuestring);
                     if (on_incoming_json_ != nullptr) {
                         on_incoming_json_(root);
                     }
@@ -242,10 +251,24 @@ std::string WebsocketProtocol::GetHelloMessage() {
 }
 
 void WebsocketProtocol::ParseServerHello(const cJSON* root) {
+    // Log the full server hello so we can inspect version / transport fields
+    char* hello_str = cJSON_PrintUnformatted(root);
+    if (hello_str) {
+        ESP_LOGI(TAG, "Server hello: %s", hello_str);
+        cJSON_free(hello_str);
+    }
+
     auto transport = cJSON_GetObjectItem(root, "transport");
     if (transport == nullptr || strcmp(transport->valuestring, "websocket") != 0) {
-        ESP_LOGE(TAG, "Unsupported transport: %s", transport->valuestring);
+        ESP_LOGE(TAG, "Unsupported transport: %s", transport != nullptr ? transport->valuestring : "(null)");
         return;
+    }
+
+    // Parse server-side protocol version (if provided) and align with it
+    auto ver = cJSON_GetObjectItem(root, "version");
+    if (cJSON_IsNumber(ver) && ver->valueint > 0) {
+        version_ = ver->valueint;
+        ESP_LOGI(TAG, "Server requests protocol version: %d", version_);
     }
 
     auto session_id = cJSON_GetObjectItem(root, "session_id");

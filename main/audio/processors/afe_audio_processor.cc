@@ -31,6 +31,8 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
     for (int i = 0; i < ref_num; i++) {
         input_format.push_back('R');
     }
+    ESP_LOGI(TAG, "AFE init: input_format=%s channels=%d ref=%d frame_samples=%d",
+             input_format.c_str(), codec_->input_channels(), ref_num, (int)frame_samples_);
 
     // Scheme B: run without local srmodels partition dependency.
     // If models are not preloaded from assets, keep AFE on built-in/basic path.
@@ -186,9 +188,11 @@ void AfeAudioProcessor::AudioProcessorTask() {
         if (vad_state_change_callback_) {
             if (res->vad_state == VAD_SPEECH && !is_speaking_) {
                 is_speaking_ = true;
+                ESP_LOGI(TAG, "VAD: SPEECH detected");
                 vad_state_change_callback_(true);
             } else if (res->vad_state == VAD_SILENCE && is_speaking_) {
                 is_speaking_ = false;
+                ESP_LOGI(TAG, "VAD: SILENCE detected");
                 vad_state_change_callback_(false);
             }
         }

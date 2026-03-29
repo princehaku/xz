@@ -4,9 +4,9 @@
 #include <driver/gpio.h>
 
 // ===================== 音频 =====================
-#define AUDIO_INPUT_SAMPLE_RATE 24000
-#define AUDIO_OUTPUT_SAMPLE_RATE 24000
-#define AUDIO_INPUT_REFERENCE true
+#define AUDIO_INPUT_SAMPLE_RATE 16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 16000
+#define AUDIO_INPUT_REFERENCE false
 
 #define AUDIO_I2S_GPIO_MCLK GPIO_NUM_38
 #define AUDIO_I2S_GPIO_WS GPIO_NUM_13

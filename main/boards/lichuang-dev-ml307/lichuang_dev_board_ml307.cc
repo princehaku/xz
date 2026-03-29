@@ -83,6 +83,10 @@ private:
     esp_timer_handle_t memory_snapshot_timer_ = nullptr;
     bool photo_task_running_ = false;
 
+    enum class AppMode { kHome, kAiGuide, kAiPhoto };
+    AppMode app_mode_ = AppMode::kHome;
+    lv_obj_t* home_overlay_ = nullptr;
+
     void LogMemorySnapshot(const char* stage) {
         const size_t heap_free = esp_get_free_heap_size();
         const size_t heap_min = esp_get_minimum_free_heap_size();
@@ -119,6 +123,112 @@ private:
             esp_timer_delete(memory_snapshot_timer_);
             memory_snapshot_timer_ = nullptr;
         }
+    }
+
+    // ──────────────────── Home screen LVGL callbacks ────────────────────
+    static void HomeScreenGuideClicked(lv_event_t* e) {
+        auto* self = static_cast<LichuangDevBoardML307*>(lv_event_get_user_data(e));
+        // Delete overlay — LVGL lock is already held inside callback context
+        if (self->home_overlay_) {
+            lv_obj_del(self->home_overlay_);
+            self->home_overlay_ = nullptr;
+        }
+        self->app_mode_ = AppMode::kAiGuide;
+        Application::GetInstance().Schedule([self]() {
+            if (self->display_) self->display_->ShowNotification("AI Chat · Press to talk");
+        });
+    }
+
+    static void HomeScreenPhotoClicked(lv_event_t* e) {
+        auto* self = static_cast<LichuangDevBoardML307*>(lv_event_get_user_data(e));
+        if (self->home_overlay_) {
+            lv_obj_del(self->home_overlay_);
+            self->home_overlay_ = nullptr;
+        }
+        self->app_mode_ = AppMode::kAiPhoto;
+        Application::GetInstance().Schedule([self]() {
+            if (self->display_) self->display_->ShowNotification("AI Camera · Press to shoot");
+        });
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    void ShowHomeScreen() {
+        if (!lvgl_port_lock(pdMS_TO_TICKS(500))) {
+            ESP_LOGW(TAG, "LVGL lock timeout, skip home screen");
+            return;
+        }
+
+        const int W = LV_HOR_RES;   // 320
+        const int H = LV_VER_RES;   // 240
+        const int MID = W / 2;      // 160
+
+        // Full-screen overlay sits on top of whatever the display shows
+        home_overlay_ = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(home_overlay_);
+        lv_obj_set_size(home_overlay_, W, H);
+        lv_obj_set_pos(home_overlay_, 0, 0);
+        lv_obj_set_style_bg_color(home_overlay_, lv_color_hex(0x0D1117), 0);
+        lv_obj_set_style_bg_opa(home_overlay_, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(home_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+
+        // ── Left zone: AI导学 (dark blue) ──
+        lv_obj_t* left = lv_obj_create(home_overlay_);
+        lv_obj_remove_style_all(left);
+        lv_obj_set_size(left, MID - 1, H);
+        lv_obj_set_pos(left, 0, 0);
+        lv_obj_set_style_bg_color(left, lv_color_hex(0x1A237E), 0);
+        lv_obj_set_style_bg_opa(left, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(left, lv_color_hex(0x3949AB), LV_STATE_PRESSED);
+        lv_obj_add_flag(left, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(left, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(left, HomeScreenGuideClicked, LV_EVENT_CLICKED, this);
+
+        lv_obj_t* l_title = lv_label_create(left);
+        lv_label_set_text(l_title, "AI\nChat");
+        lv_obj_set_style_text_color(l_title, lv_color_white(), 0);
+        lv_obj_set_style_text_align(l_title, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(l_title, &lv_font_montserrat_24, 0);
+        lv_obj_align(l_title, LV_ALIGN_CENTER, 0, -10);
+
+        lv_obj_t* l_hint = lv_label_create(left);
+        lv_label_set_text(l_hint, "Voice Chat");
+        lv_obj_set_style_text_color(l_hint, lv_color_hex(0x9FA8DA), 0);
+        lv_obj_align(l_hint, LV_ALIGN_BOTTOM_MID, 0, -16);
+
+        // ── Center divider ──
+        lv_obj_t* div = lv_obj_create(home_overlay_);
+        lv_obj_remove_style_all(div);
+        lv_obj_set_size(div, 2, H);
+        lv_obj_set_pos(div, MID - 1, 0);
+        lv_obj_set_style_bg_color(div, lv_color_hex(0x333355), 0);
+        lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
+
+        // ── Right zone: AI拍 (dark teal) ──
+        lv_obj_t* right = lv_obj_create(home_overlay_);
+        lv_obj_remove_style_all(right);
+        lv_obj_set_size(right, W - MID - 1, H);
+        lv_obj_set_pos(right, MID + 1, 0);
+        lv_obj_set_style_bg_color(right, lv_color_hex(0x004D40), 0);
+        lv_obj_set_style_bg_opa(right, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(right, lv_color_hex(0x00695C), LV_STATE_PRESSED);
+        lv_obj_add_flag(right, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(right, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(right, HomeScreenPhotoClicked, LV_EVENT_CLICKED, this);
+
+        lv_obj_t* r_title = lv_label_create(right);
+        lv_label_set_text(r_title, "AI\nCamera");
+        lv_obj_set_style_text_color(r_title, lv_color_white(), 0);
+        lv_obj_set_style_text_align(r_title, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(r_title, &lv_font_montserrat_24, 0);
+        lv_obj_align(r_title, LV_ALIGN_CENTER, 0, -10);
+
+        lv_obj_t* r_hint = lv_label_create(right);
+        lv_label_set_text(r_hint, "Take Photo");
+        lv_obj_set_style_text_color(r_hint, lv_color_hex(0x80CBC4), 0);
+        lv_obj_align(r_hint, LV_ALIGN_BOTTOM_MID, 0, -16);
+
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "Home screen shown");
     }
 
     void CaptureAndExplainPhoto() {
@@ -168,7 +278,7 @@ private:
             try {
                 LogMemorySnapshot("photo_before_explain");
                 const std::string question =
-                    "请识别这张图片中的主要内容，并用中文简要说明。回答尽量简短，控制在100字以内。";
+                    "请识别这张图片中的主要内容，并用中文简要说明，比如是柴犬而不是狗，不要提及分辨率和效果差。回答尽量简短，控制在100字以内。";
                 std::string result = camera_->Explain(question);
                 ESP_LOGI(TAG, "Photo explain result: %s", result.c_str());
 
@@ -178,7 +288,7 @@ private:
                 }
 
                 // Feed result back as a fake STT utterance so the LLM reads it aloud.
-                std::string fake_cmd = "我拍了一张照片，内容是：" + result + "。请用短句向我介绍一下。";
+                std::string fake_cmd = "我拍了一张照片，内容是：" + result + "。请用百科向我介绍一下里面的东西，细化到详细。";
                 app.NotifySTT(fake_cmd);
                 LogMemorySnapshot("photo_after_explain");
             } catch (const std::exception& e) {
@@ -186,10 +296,8 @@ private:
                 if (display_) display_->ShowNotification("后端识图失败");
             }
 
-            // Resume listening if we interrupted it.
-            if (state_before == kDeviceStateListening) {
-                app.StartListening();
-            }
+            // After TTS response finishes, device auto-returns to listening (auto mode)
+            // so user can ask follow-up questions by voice without pressing button again.
 
             LogMemorySnapshot("photo_exit");
             reset_busy();
@@ -334,21 +442,37 @@ private:
     }
 
     void InitializeButtons() {
-        // Single click: trigger photo capture + explain.
-        // During startup (WiFi config mode), retain WiFi config entry.
+        // Single click: behavior depends on current app mode.
+        //   kHome     → nothing (mode must be selected via touch)
+        //   kAiPhoto  → take photo + explain
+        //   kAiGuide  → wake / toggle voice assistant
+        // During device startup, enter WiFi config mode instead.
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (GetNetworkType() == NetworkType::WIFI) {
-                if (app.GetDeviceState() == kDeviceStateStarting) {
-                    auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
-                    wifi_board.EnterWifiConfigMode();
-                    return;
-                }
+            if (GetNetworkType() == NetworkType::WIFI &&
+                app.GetDeviceState() == kDeviceStateStarting) {
+                auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
+                wifi_board.EnterWifiConfigMode();
+                return;
             }
-            CaptureAndExplainPhoto();
+            switch (app_mode_) {
+                case AppMode::kAiPhoto:
+                    ESP_LOGI(TAG, "Button: kAiPhoto state=%d", (int)app.GetDeviceState());
+                    CaptureAndExplainPhoto();
+                    break;
+                case AppMode::kAiGuide:
+                    ESP_LOGI(TAG, "Button: kAiGuide state=%d", (int)app.GetDeviceState());
+                    app.ToggleChatState();
+                    break;
+                case AppMode::kHome:
+                default:
+                    ESP_LOGW(TAG, "Button: kHome - mode not selected yet");
+                    if (display_) display_->ShowNotification("请先选择左侧或右侧功能区");
+                    break;
+            }
         });
 
-        // Double click: toggle voice conversation; during startup switch network type.
+        // Double click: during startup switch network type; otherwise go back to home screen.
         boot_button_.OnDoubleClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting ||
@@ -356,7 +480,9 @@ private:
                 SwitchNetworkType();
                 return;
             }
-            app.ToggleChatState();
+            // Return to home screen (re-select mode)
+            app_mode_ = AppMode::kHome;
+            ShowHomeScreen();
         });
 
 #if CONFIG_USE_DEVICE_AEC
@@ -395,6 +521,7 @@ public:
         InitializeTools();
         GetBacklight()->RestoreBrightness();
         StartMemorySnapshotTimer();
+        ShowHomeScreen();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

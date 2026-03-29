@@ -155,10 +155,10 @@ private:
 
     std::string BuildPhotoQuestion() const {
         static const char* kModeQuestions[] = {
-            "请识别这张图片中的主要内容，并用中文+中文百科的方式简要说明。请尽可能之别这张图片中的关键物体。"
+            "请识别这张图片中的主要内容，并用中文简要说明，比如是柴犬而不是狗，不要提及分辨率和效果差。"
         };
         static const char* kSetHints[] = {
-            "回答尽量简短，给出关键细节，控制在100字以内。"
+            "回答尽量简短，控制在100字以内。"
         };
         constexpr size_t kModeCount = sizeof(kModeQuestions) / sizeof(kModeQuestions[0]);
         constexpr size_t kSetCount = sizeof(kSetHints) / sizeof(kSetHints[0]);

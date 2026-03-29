@@ -1,6 +1,8 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include <freertos/idf_additions.h>
+#include <esp_heap_caps.h>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -83,13 +85,21 @@ void AudioService::Initialize(AudioCodec* codec) {
         encoder_frame_size_ = encoder_frame_size_ / sizeof(int16_t);
     }
 
+    ESP_LOGI(TAG, "Audio init: codec_in=%dHz codec_out=%dHz encoder_frame=%u encoder_outbuf=%u",
+             codec->input_sample_rate(), codec->output_sample_rate(),
+             (unsigned)encoder_frame_size_, (unsigned)encoder_outbuf_size_);
+
     if (codec->input_sample_rate() != 16000) {
+        ESP_LOGI(TAG, "Input resampler: %d -> 16000 Hz (channels=%d)",
+                 codec->input_sample_rate(), codec->input_channels());
         esp_ae_rate_cvt_cfg_t input_resampler_cfg = RATE_CVT_CFG(
             codec->input_sample_rate(), ESP_AUDIO_SAMPLE_RATE_16K, codec->input_channels());
         auto resampler_ret = esp_ae_rate_cvt_open(&input_resampler_cfg, &input_resampler_);
         if (input_resampler_ == nullptr) {
             ESP_LOGE(TAG, "Failed to create input resampler, error code: %d", resampler_ret);
         }
+    } else {
+        ESP_LOGI(TAG, "Input resampler: not needed (codec already at 16000 Hz)");
     }
 
 #if CONFIG_USE_AUDIO_PROCESSOR
@@ -165,12 +175,14 @@ void AudioService::Start() {
     }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
 #endif
 
-    /* Start the opus codec task */
-    xTaskCreate([](void* arg) {
+    /* Start the opus codec task with PSRAM stack to avoid internal SRAM pressure.
+     * SILK encoder (VOIP mode) needs ~40KB stack; PSRAM is fine for non-ISR codec work. */
+    xTaskCreateWithCaps([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
-        vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+        vTaskDeleteWithCaps(NULL);
+    }, "opus_codec", 2048 * 20, this, 2, &opus_codec_task_handle_,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
 void AudioService::Stop() {
@@ -433,6 +445,14 @@ void AudioService::OpusCodecTask() {
                 auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
                 if (ret == ESP_AUDIO_ERR_OK) {
                     packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
+                    static uint32_t encode_count = 0;
+                    encode_count++;
+                    if (encode_count == 1 || encode_count % 50 == 0) {
+                        ESP_LOGI(TAG, "Opus encoded #%lu: pcm=%u bytes=%u",
+                                 (unsigned long)encode_count,
+                                 (unsigned)encoder_frame_size_,
+                                 (unsigned)out.encoded_bytes);
+                    }
 
                     if (task->type == kAudioTaskTypeEncodeToSendQueue) {
                         {
@@ -601,7 +621,9 @@ void AudioService::EnableWakeWordDetection(bool enable) {
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {
-    ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
+    ESP_LOGI(TAG, "%s voice processing (encoder_frame=%u sample_rate=%d)",
+             enable ? "Enabling" : "Disabling",
+             (unsigned)encoder_frame_size_, encoder_sample_rate_);
     if (enable) {
         if (!audio_processor_initialized_) {
             audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
