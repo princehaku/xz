@@ -57,6 +57,10 @@
 #define CAMERA_PIN_PCLK GPIO_NUM_7
 #define XCLK_FREQ_HZ 20000000
 
+// Default vision endpoint (overridden by MCP capabilities vision.url each session;
+// loaded from NVS on reboot as fallback)
+#define CAMERA_EXPLAIN_URL_DEFAULT "https://esp-ai.bytegallop.com/mcp/vision/explain"
+
 // ===================== ML307R 4G 模块 =====================
 // 接线到板子上的 J2「外部接口（多用）」5pin 连接器：
 //   ML307R PIN1 (VIN)  ----> J2 Pin4 (VBUS 5V)

@@ -8,8 +8,14 @@
 #include "i2c_device.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
+#include "settings.h"
 #include "assets/lang_config.h"
 #include "led/single_led.h"
+
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -74,6 +80,121 @@ private:
     Display* display_;
     Pca9557* pca9557_;
     Esp32Camera* camera_;
+    esp_timer_handle_t memory_snapshot_timer_ = nullptr;
+    bool photo_task_running_ = false;
+
+    void LogMemorySnapshot(const char* stage) {
+        const size_t heap_free = esp_get_free_heap_size();
+        const size_t heap_min = esp_get_minimum_free_heap_size();
+        const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        ESP_LOGI("MEM", "[%s] heap=%u heap_min=%u int=%u int_largest=%u psram=%u psram_largest=%u",
+            stage,
+            (unsigned)heap_free, (unsigned)heap_min,
+            (unsigned)internal_free, (unsigned)internal_largest,
+            (unsigned)psram_free, (unsigned)psram_largest);
+    }
+
+    static void MemorySnapshotTimerCallback(void* arg) {
+        static_cast<LichuangDevBoardML307*>(arg)->LogMemorySnapshot("periodic_5s");
+    }
+
+    void StartMemorySnapshotTimer() {
+        if (memory_snapshot_timer_ != nullptr) return;
+        const esp_timer_create_args_t timer_args = {
+            .callback = &LichuangDevBoardML307::MemorySnapshotTimerCallback,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "mem_probe_5s",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&timer_args, &memory_snapshot_timer_) != ESP_OK) {
+            ESP_LOGW(TAG, "Create memory snapshot timer failed");
+            return;
+        }
+        if (esp_timer_start_periodic(memory_snapshot_timer_, 5 * 1000 * 1000) != ESP_OK) {
+            ESP_LOGW(TAG, "Start memory snapshot timer failed");
+            esp_timer_delete(memory_snapshot_timer_);
+            memory_snapshot_timer_ = nullptr;
+        }
+    }
+
+    void CaptureAndExplainPhoto() {
+        if (photo_task_running_) {
+            if (display_) display_->ShowNotification("拍照任务进行中");
+            return;
+        }
+        photo_task_running_ = true;
+
+        auto& app = Application::GetInstance();
+        app.Schedule([this]() {
+            auto reset_busy = [this]() { photo_task_running_ = false; };
+            auto& app = Application::GetInstance();
+            DeviceState state_before = app.GetDeviceState();
+
+            // Quiesce voice pipeline before camera HTTP upload.
+            if (state_before == kDeviceStateSpeaking) {
+                app.AbortSpeaking(kAbortReasonNone);
+                vTaskDelay(pdMS_TO_TICKS(80));
+            }
+            if (state_before == kDeviceStateListening ||
+                state_before == kDeviceStateConnecting ||
+                state_before == kDeviceStateSpeaking) {
+                app.SetDeviceState(kDeviceStateIdle);
+                for (int i = 0; i < 10; ++i) {
+                    if (app.GetDeviceState() == kDeviceStateIdle) break;
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+            }
+
+            if (camera_ == nullptr) {
+                ESP_LOGE(TAG, "Camera not initialized");
+                if (display_) display_->ShowNotification("摄像头未初始化");
+                reset_busy();
+                return;
+            }
+
+            if (display_) display_->ShowNotification("拍照中...");
+
+            if (!camera_->Capture()) {
+                ESP_LOGE(TAG, "Camera capture failed");
+                if (display_) display_->ShowNotification("拍照失败");
+                reset_busy();
+                return;
+            }
+
+            try {
+                LogMemorySnapshot("photo_before_explain");
+                const std::string question =
+                    "请识别这张图片中的主要内容，并用中文简要说明。回答尽量简短，控制在100字以内。";
+                std::string result = camera_->Explain(question);
+                ESP_LOGI(TAG, "Photo explain result: %s", result.c_str());
+
+                if (display_) {
+                    display_->ShowNotification("识图完成");
+                    display_->SetChatMessage("assistant", result.c_str());
+                }
+
+                // Feed result back as a fake STT utterance so the LLM reads it aloud.
+                std::string fake_cmd = "我拍了一张照片，内容是：" + result + "。请用短句向我介绍一下。";
+                app.NotifySTT(fake_cmd);
+                LogMemorySnapshot("photo_after_explain");
+            } catch (const std::exception& e) {
+                ESP_LOGE(TAG, "Photo explain failed: %s", e.what());
+                if (display_) display_->ShowNotification("后端识图失败");
+            }
+
+            // Resume listening if we interrupted it.
+            if (state_before == kDeviceStateListening) {
+                app.StartListening();
+            }
+
+            LogMemorySnapshot("photo_exit");
+            reset_busy();
+        });
+    }
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -197,9 +318,24 @@ private:
         config.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
 
         camera_ = new Esp32Camera(config);
+
+        // Restore persisted image-explain endpoint so it survives reboots between
+        // MCP sessions (MCP capabilities will override it each new connection).
+        Settings camera_settings("camera", false);
+        std::string explain_url = camera_settings.GetString("explain_url");
+        std::string explain_token = camera_settings.GetString("explain_token");
+        if (explain_url.empty()) {
+            explain_url = CAMERA_EXPLAIN_URL_DEFAULT;
+            ESP_LOGI(TAG, "Using default camera explain endpoint");
+        } else {
+            ESP_LOGI(TAG, "Loaded persisted camera explain endpoint");
+        }
+        camera_->SetExplainUrl(explain_url, explain_token);
     }
 
     void InitializeButtons() {
+        // Single click: trigger photo capture + explain.
+        // During startup (WiFi config mode), retain WiFi config entry.
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
             if (GetNetworkType() == NetworkType::WIFI) {
@@ -209,15 +345,18 @@ private:
                     return;
                 }
             }
-            app.ToggleChatState();
+            CaptureAndExplainPhoto();
         });
 
+        // Double click: toggle voice conversation; during startup switch network type.
         boot_button_.OnDoubleClick([this]() {
             auto& app = Application::GetInstance();
             if (app.GetDeviceState() == kDeviceStateStarting ||
                 app.GetDeviceState() == kDeviceStateWifiConfiguring) {
                 SwitchNetworkType();
+                return;
             }
+            app.ToggleChatState();
         });
 
 #if CONFIG_USE_DEVICE_AEC
@@ -255,6 +394,7 @@ public:
         InitializeCamera();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
+        StartMemorySnapshotTimer();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
