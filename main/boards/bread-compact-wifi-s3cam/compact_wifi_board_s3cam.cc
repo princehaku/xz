@@ -236,8 +236,7 @@ private:
                     display_->SetChatMessage("assistant", result.c_str());
                 }
 
-                // 使用 NotifySTT 代替手动构造 JSON，确保连接状态正确处理
-                std::string fake_user_command = "我拍了一张照片，内容是：" + result + "。请用短句向我介绍一下。";
+                std::string fake_user_command = "我拍了一张照片，内容是：" + result + "。请用百科向我介绍一下里面的东西，细化到详细。";
                 app.NotifySTT(fake_user_command);
 
                 LogMemorySnapshot("photo_after_explain");
@@ -248,11 +247,8 @@ private:
                 }
             }
 
-            // Restore listening state after photo pipeline completes.
-            if (state_before_photo == kDeviceStateListening) {
-                app.StartListening();
-                LogMemorySnapshot("photo_after_resume_listening");
-            }
+            // After TTS response finishes, device auto-returns to listening (auto mode)
+            // so user can ask follow-up questions by voice without pressing button again.
 
             LogMemorySnapshot("photo_exit");
             reset_busy();
@@ -337,8 +333,7 @@ private:
         config.pin_reset = CAMERA_PIN_RESET;
         config.xclk_freq_hz = XCLK_FREQ_HZ;
         config.pixel_format = PIXFORMAT_RGB565;
-        // Keep framebuffer small to avoid DRAM allocation failure on this board.
-        config.frame_size = FRAMESIZE_QQVGA;
+        config.frame_size = FRAMESIZE_QVGA;
         config.jpeg_quality = 12;
         config.fb_count = 1;
         config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -371,6 +366,15 @@ private:
             app.ToggleChatState();
         });
 
+#if CONFIG_USE_DEVICE_AEC
+        boot_button_.OnLongPress([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateIdle) {
+                app.SetAecMode(app.GetAecMode() == kAecOff ? kAecOnDeviceSide : kAecOff);
+            }
+        });
+#endif
+
         change_photo_button_.OnClick([this]() {
             photo_mode_index_++;
             ESP_LOGI(TAG, "Photo mode switched to: %s", GetPhotoModeName());
@@ -388,13 +392,19 @@ private:
         });
 
         take_photo_button_.OnClick([this]() {
-            if (display_) {
-                display_->ShowNotification("已发送拍照请求");
-            }
-            auto& app = Application::GetInstance();
-            // Simulate a user utterance so cloud side can trigger camera tool flow.
-            app.NotifySTT("帮我拍照并用中英百科解释");
+            CaptureAndExplainPhoto();
         });
+    }
+
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.system.reconfigure_wifi",
+            "End this conversation and enter WiFi configuration mode.\n"
+            "**CAUTION** You must ask the user to confirm this action.",
+            PropertyList(), [this](const PropertyList& properties) {
+                EnterWifiConfigMode();
+                return true;
+            });
     }
 
     void InitializeBatteryMonitor() {
@@ -435,6 +445,7 @@ public:
         LogMemorySnapshot("after_buttons");
         InitializeCamera();
         LogMemorySnapshot("after_camera");
+        InitializeTools();
         StartMemorySnapshotTimer();
         // Use full-scale software volume by default for this board.
         GetAudioCodec()->SetOutputVolume(100);
@@ -500,6 +511,11 @@ public:
         charging = false;
         discharging = true;
         return true;
+    }
+
+    virtual void StartNetwork() override {
+        WifiBoard::StartNetwork();
+        SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     }
 };
 
