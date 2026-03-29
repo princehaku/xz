@@ -153,7 +153,7 @@ private:
     int encoder_frame_size_ = 0;
     int encoder_outbuf_size_ = 0;
     int decoder_sample_rate_ = 0;
-    int decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
+    int decoder_duration_ms_ = 120;
     int decoder_frame_size_ = 0;
     DebugStatistics debug_statistics_;
     srmodel_list_t* models_list_ = nullptr;
