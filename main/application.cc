@@ -242,18 +242,16 @@ void Application::Run() {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
                 bool speaking = audio_service_.IsVoiceDetected();
-                if (speaking) {
-                    // Mark that the user has started speaking in this session
+                int64_t elapsed_ms = (esp_timer_get_time() / 1000) - vad_listen_start_ms_;
+                bool speaking = audio_service_.IsVoiceDetected();
+                if (speaking && elapsed_ms >= 1500) {
+                    // Only set after warmup guard — filters AFE false SPEECH bursts on start
                     vad_speech_started_ = true;
-                } else if (vad_speech_started_) {
-                    // Silence detected after speech → auto-stop and play feedback sound
-                    // But guard against AFE warmup false positives (first ~1500ms after listen start)
-                    int64_t elapsed_ms = (esp_timer_get_time() / 1000) - vad_listen_start_ms_;
-                    if (elapsed_ms >= 1500) {
-                        vad_speech_started_ = false;
-                        audio_service_.PlaySound(Lang::Sounds::OGG_1);
-                        StopListening();
-                    }
+                } else if (!speaking && vad_speech_started_) {
+                    // Silence after confirmed speech → auto-stop with popup sound feedback
+                    vad_speech_started_ = false;
+                    audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
+                    StopListening();
                 }
             }
         }
