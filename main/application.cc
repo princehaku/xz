@@ -241,7 +241,6 @@ void Application::Run() {
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
-                bool speaking = audio_service_.IsVoiceDetected();
                 int64_t elapsed_ms = (esp_timer_get_time() / 1000) - vad_listen_start_ms_;
                 bool speaking = audio_service_.IsVoiceDetected();
                 if (speaking && elapsed_ms >= 1500) {
