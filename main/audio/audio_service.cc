@@ -359,7 +359,7 @@ void AudioService::OpusCodecTask() {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(lock, [this]() {
             return service_stopped_ ||
-                (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) ||
+                !audio_encode_queue_.empty() ||
                 (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE);
         });
         if (service_stopped_) {
@@ -422,12 +422,17 @@ void AudioService::OpusCodecTask() {
             debug_statistics_.decode_count++;
         }
         /* Encode the audio to send queue */
-        if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+        if (!audio_encode_queue_.empty()) {
+            /* If the send queue is full (no consumer active, e.g. during camera HTTP upload),
+             * silently drain the encode queue to prevent backlog and warning spam. */
+            if (audio_send_queue_.size() >= MAX_SEND_PACKETS_IN_QUEUE) {
+                audio_encode_queue_.pop_front();
+                audio_queue_cv_.notify_all();
+                /* lock still held – continue to next loop iteration */
             /* Software echo suppression: discard mic audio while TTS is playing or
              * queued for playback.  This prevents the speaker output from feeding
              * back into the ASR pipeline when AEC hardware reference is unavailable. */
-            bool tts_active = !audio_playback_queue_.empty() || !audio_decode_queue_.empty();
-            if (tts_active) {
+            } else if (!audio_playback_queue_.empty() || !audio_decode_queue_.empty()) {
                 audio_encode_queue_.pop_front();
                 audio_queue_cv_.notify_all();
                 /* lock still held – continue to next loop iteration */
@@ -486,7 +491,7 @@ void AudioService::OpusCodecTask() {
                              task->pcm.size(), encoder_frame_size_);
                 }
                 lock.lock();
-            } /* else (not tts_active) */
+            } /* else (encode normally) */
         } /* if encode_queue non-empty */
     } /* while */
 
