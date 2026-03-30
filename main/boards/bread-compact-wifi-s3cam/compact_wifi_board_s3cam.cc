@@ -517,6 +517,11 @@ public:
         WifiBoard::StartNetwork();
         SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
     }
+
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        // This board is always-on; ignore LOW_POWER requests to keep WiFi responsive.
+        WifiBoard::SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+    }
 };
 
 DECLARE_BOARD(CompactWifiBoardS3Cam);

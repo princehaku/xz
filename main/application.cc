@@ -241,6 +241,20 @@ void Application::Run() {
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+                bool speaking = audio_service_.IsVoiceDetected();
+                if (speaking) {
+                    // Mark that the user has started speaking in this session
+                    vad_speech_started_ = true;
+                } else if (vad_speech_started_) {
+                    // Silence detected after speech → auto-stop and play feedback sound
+                    // But guard against AFE warmup false positives (first ~1500ms after listen start)
+                    int64_t elapsed_ms = (esp_timer_get_time() / 1000) - vad_listen_start_ms_;
+                    if (elapsed_ms >= 1500) {
+                        vad_speech_started_ = false;
+                        audio_service_.PlaySound(Lang::Sounds::OGG_1);
+                        StopListening();
+                    }
+                }
             }
         }
 
@@ -599,7 +613,7 @@ void Application::InitializeProtocol() {
             auto message = cJSON_GetObjectItem(root, "message");
             auto emotion = cJSON_GetObjectItem(root, "emotion");
             if (cJSON_IsString(status) && cJSON_IsString(message) && cJSON_IsString(emotion)) {
-                Alert(status->valuestring, message->valuestring, emotion->valuestring, Lang::Sounds::OGG_VIBRATION);
+                Alert(status->valuestring, message->valuestring, emotion->valuestring, Lang::Sounds::OGG_ACTIVATION);
             } else {
                 ESP_LOGW(TAG, "Alert command requires status, message and emotion");
             }
@@ -897,6 +911,10 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
+            // Reset VAD speech tracking for the new listening session
+            vad_speech_started_ = false;
+            // Record start time to guard against AFE warmup false SPEECH+SILENCE
+            vad_listen_start_ms_ = esp_timer_get_time() / 1000;
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {

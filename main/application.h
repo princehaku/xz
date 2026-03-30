@@ -142,6 +142,8 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    bool vad_speech_started_ = false;       // Flag: user has spoken in this listening session (for auto-stop)
+    int64_t vad_listen_start_ms_ = 0;       // Timestamp (ms) when listening state was entered (for warmup guard)
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
     std::string pending_stt_text_;

@@ -127,6 +127,8 @@ private:
                 EnterWifiConfigMode();
                 return;
             }
+            // Play a brief click sound as immediate button feedback
+            app.PlaySound(Lang::Sounds::OGG_ACTIVATION);
             app.ToggleChatState();
         });
 
