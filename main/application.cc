@@ -554,15 +554,25 @@ void Application::InitializeProtocol() {
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
-                    if (GetDeviceState() == kDeviceStateSpeaking) {
-                        if (listening_mode_ == kListeningModeManualStop) {
-                            SetDeviceState(kDeviceStateIdle);
-                        } else {
-                            SetDeviceState(kDeviceStateListening);
+                // WebSockets/MQTT tasks shouldn't be blocked. Spawn a FreeRTOS task to wait.
+                xTaskCreate([](void* arg) {
+                    auto app = static_cast<Application*>(arg);
+                    app->GetAudioService().WaitForPlaybackQueueEmpty();
+                    
+                    app->Schedule([app]() {
+                        if (app->GetDeviceState() == kDeviceStateSpeaking && !app->aborted_) {
+                            if (app->listening_mode_ == kListeningModeManualStop) {
+                                app->SetDeviceState(kDeviceStateIdle);
+                            } else {
+                                // TTS 播报结束，标记延长 VAD 热身保护，
+                                // 防止扬声器尾音和环境音在 Listening 进入时误判为语音
+                                app->tts_just_finished_ = true;
+                                app->SetDeviceState(kDeviceStateListening);
+                            }
                         }
-                    }
-                });
+                    });
+                    vTaskDelete(NULL);
+                }, "wait_tts", 3072, this, 5, NULL);
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
@@ -851,7 +861,8 @@ void Application::HandleWakeWordDetectedEvent() {
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting) {
+    auto state = GetDeviceState();
+    if (state != kDeviceStateConnecting && state != kDeviceStateIdle) {
         return;
     }
 
@@ -908,19 +919,21 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
-            // Reset VAD speech tracking for the new listening session
+            // 重置 VAD 语音检测状态，开始新一轮监听
             vad_speech_started_ = false;
-            // Record start time to guard against AFE warmup false SPEECH+SILENCE
-            vad_listen_start_ms_ = esp_timer_get_time() / 1000;
+            // 记录进入时间，如果 TTS 刚结束则额外延长 1500ms，
+            // 将总热身护带提至 3000ms，避免扬声器尾音/环境音误制动 VAD
+            if (tts_just_finished_) {
+                // 将计时起点往后推 1500ms：即 elapsed_ms 要当前时间超过起点3000ms 才能触发 VAD 语音检测
+                vad_listen_start_ms_ = esp_timer_get_time() / 1000 + 1500;
+                tts_just_finished_ = false;
+                ESP_LOGI(TAG, "TTS 结束后进入监听，VAD 热身护带延长至 3000ms");
+            } else {
+                vad_listen_start_ms_ = esp_timer_get_time() / 1000;
+            }
 
             // Make sure the audio processor is running
             if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
-                // For auto mode, wait for playback queue to be empty before enabling voice processing
-                // This prevents audio truncation when STOP arrives late due to network jitter
-                if (listening_mode_ == kListeningModeAutoStop) {
-                    audio_service_.WaitForPlaybackQueueEmpty();
-                }
-                
                 // Send the start listening command
                 protocol_->SendStartListening(listening_mode_);
                 audio_service_.EnableVoiceProcessing(true);
@@ -1028,7 +1041,7 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
     audio_service_.Stop();
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    bool upgrade_success = Ota::Upgrade(upgrade_url, [this, display](int progress, size_t speed) {
+    bool upgrade_success = ota_->Upgrade(upgrade_url, [this, display](int progress, size_t speed) {
         char buffer[32];
         snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
         Schedule([display, message = std::string(buffer)]() {
@@ -1157,15 +1170,24 @@ void Application::ResetProtocol() {
 
 void Application::NotifySTT(const std::string& text) {
     Schedule([this, text]() {
+        // 拍照 STT 通知：TTS 播报结束后回到 Idle，而不是自动进入 Listening。
+        // 使用 ManualStop 模式：TTS 停止时状态机切到 Idle，用户须主动唤醒
+        // （按键或唤醒词）才能继续对话，避免环境音被 VAD 误判为语音触发断连。
+        const ListeningMode notify_mode = kListeningModeManualStop;
+
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
-            ESP_LOGI(TAG, "Sending STT text: %s", text.c_str());
+            ESP_LOGI(TAG, "Sending STT text (ManualStop): %s", text.c_str());
+            // 先把 listening_mode_ 设为 ManualStop，
+            // 这样 OnIncomingJson 里 tts/stop 分支会把设备切回 Idle 而非 Listening
+            listening_mode_ = notify_mode;
             protocol_->SendWakeWordDetected(text);
         } else {
-            ESP_LOGI(TAG, "Pending STT text: %s", text.c_str());
+            ESP_LOGI(TAG, "Pending STT text (ManualStop): %s", text.c_str());
             pending_stt_text_ = text;
             if (GetDeviceState() == kDeviceStateIdle) {
                 SetDeviceState(kDeviceStateConnecting);
-                ContinueOpenAudioChannel(GetDefaultListeningMode());
+                // 使用 ManualStop 开启通道，TTS 结束后回 Idle 不监听
+                ContinueOpenAudioChannel(notify_mode);
             }
         }
     });
