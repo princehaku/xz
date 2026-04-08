@@ -516,7 +516,7 @@ void Application::InitializeProtocol() {
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
-            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet))) {
+            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet), true)) {
                 static uint32_t dropped;
                 dropped++;
                 if ((dropped & 0x1Fu) == 1u) {
@@ -561,18 +561,29 @@ void Application::InitializeProtocol() {
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                Schedule([this]() {
-                    if (GetDeviceState() != kDeviceStateSpeaking || aborted_) {
-                        return;
-                    }
-                    audio_service_.ResetDecoder();
-                    if (listening_mode_ == kListeningModeManualStop) {
-                        SetDeviceState(kDeviceStateIdle);
-                    } else {
-                        tts_just_finished_ = true;
-                        SetDeviceState(kDeviceStateListening);
-                    }
-                });
+                ESP_LOGI(TAG, "Received TTS stop, waiting for playback to finish...");
+                xTaskCreate([](void* arg) {
+                    Application* app = (Application*)arg;
+                    app->GetAudioService().WaitForPlaybackQueueEmpty();
+                    ESP_LOGI(TAG, "Playback queue completely empty. Transitioning state...");
+                    
+                    app->Schedule([app]() {
+                        if (app->GetDeviceState() != kDeviceStateSpeaking || app->aborted_) {
+                            ESP_LOGI(TAG, "State transition aborted (state=%d, aborted=%d)", 
+                                     app->GetDeviceState(), app->aborted_);
+                            return;
+                        }
+                        ESP_LOGI(TAG, "Resetting decoder and changing state.");
+                        app->GetAudioService().ResetDecoder();
+                        if (app->listening_mode_ == kListeningModeManualStop) {
+                            app->SetDeviceState(kDeviceStateIdle);
+                        } else {
+                            app->tts_just_finished_ = true;
+                            app->SetDeviceState(kDeviceStateListening);
+                        }
+                    });
+                    vTaskDelete(NULL);
+                }, "wait_playback", 1024 * 3, this, 5, NULL);
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {

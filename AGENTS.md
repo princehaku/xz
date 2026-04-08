@@ -38,12 +38,7 @@ For CI-style multi-board builds, see `scripts/release.py`.
 - Run lint check: `clang-format --dry-run <file>` or `clang-format -i <file>` to auto-fix.
 - `clang-format-19` is installed and symlinked as `clang-format`.
 
-### Testing
-
-There are no automated unit tests in this repository. Validation is done by successful compilation (`idf.py build`). End-to-end testing requires physical ESP32 hardware.
-
 ### Key gotchas
 
-- After `idf.py set-target`, ESP-IDF Component Manager downloads ~40+ managed components into `/workspace/managed_components/`. This directory is gitignored and auto-populated.
 - The `build/` directory is gitignored. A clean build after target change takes ~2 minutes.
 - The `.agents/rules/dev.md` rule says "你别自己build" (don't build yourself) and "改动尽量只动 bread-compact-wifi-s3cam 和 sdkconfig" (changes should focus on bread-compact-wifi-s3cam and sdkconfig). Respect this when making code changes.
