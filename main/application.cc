@@ -516,7 +516,14 @@ void Application::InitializeProtocol() {
     
     protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
         if (GetDeviceState() == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            if (!audio_service_.PushPacketToDecodeQueue(std::move(packet))) {
+                static uint32_t dropped;
+                dropped++;
+                if ((dropped & 0x1Fu) == 1u) {
+                    ESP_LOGW(TAG, "Decode queue full, dropped %lu TTS packet(s) (crackles if frequent)",
+                             (unsigned long)dropped);
+                }
+            }
         }
     });
     

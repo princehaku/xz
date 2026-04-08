@@ -183,7 +183,8 @@ void AudioService::Start() {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDeleteWithCaps(NULL);
-    }, "opus_codec", 2048 * 20, this, 2, &opus_codec_task_handle_,
+    /* Priority above typical worker tasks so decode keeps playback queue fed (avoids speaker underrun). */
+    }, "opus_codec", 2048 * 20, this, 5, &opus_codec_task_handle_,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
@@ -419,7 +420,6 @@ void AudioService::OpusCodecTask() {
                 ESP_LOGE(TAG, "Audio decoder is not configured");
                 lock.lock();
             }
-            debug_statistics_.decode_count++;
         }
         /* Encode the audio to send queue */
         if (!audio_encode_queue_.empty()) {
