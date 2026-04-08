@@ -554,25 +554,18 @@ void Application::InitializeProtocol() {
                     SetDeviceState(kDeviceStateSpeaking);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
-                // WebSockets/MQTT tasks shouldn't be blocked. Spawn a FreeRTOS task to wait.
-                xTaskCreate([](void* arg) {
-                    auto app = static_cast<Application*>(arg);
-                    app->GetAudioService().WaitForPlaybackQueueEmpty();
-                    
-                    app->Schedule([app]() {
-                        if (app->GetDeviceState() == kDeviceStateSpeaking && !app->aborted_) {
-                            if (app->listening_mode_ == kListeningModeManualStop) {
-                                app->SetDeviceState(kDeviceStateIdle);
-                            } else {
-                                // TTS 播报结束，标记延长 VAD 热身保护，
-                                // 防止扬声器尾音和环境音在 Listening 进入时误判为语音
-                                app->tts_just_finished_ = true;
-                                app->SetDeviceState(kDeviceStateListening);
-                            }
-                        }
-                    });
-                    vTaskDelete(NULL);
-                }, "wait_tts", 3072, this, 5, NULL);
+                Schedule([this]() {
+                    if (GetDeviceState() != kDeviceStateSpeaking || aborted_) {
+                        return;
+                    }
+                    audio_service_.ResetDecoder();
+                    if (listening_mode_ == kListeningModeManualStop) {
+                        SetDeviceState(kDeviceStateIdle);
+                    } else {
+                        tts_just_finished_ = true;
+                        SetDeviceState(kDeviceStateListening);
+                    }
+                });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
                 if (cJSON_IsString(text)) {
@@ -908,6 +901,7 @@ void Application::HandleStateChangedEvent() {
             display->SetStatus(Lang::Strings::STANDBY);
             display->ClearChatMessages();  // Clear messages first
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+            audio_service_.SetKeepUplink(false);
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
             break;
@@ -919,6 +913,7 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
+            audio_service_.SetKeepUplink(false);
             // 重置 VAD 语音检测状态，开始新一轮监听
             vad_speech_started_ = false;
             // 记录进入时间，如果 TTS 刚结束则额外延长 1500ms，
@@ -956,9 +951,10 @@ void Application::HandleStateChangedEvent() {
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
 
-            if (listening_mode_ != kListeningModeRealtime) {
+            if (listening_mode_ == kListeningModeRealtime) {
+                audio_service_.SetKeepUplink(true);
+            } else {
                 audio_service_.EnableVoiceProcessing(false);
-                // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
             }
             audio_service_.ResetDecoder();

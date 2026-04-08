@@ -431,10 +431,15 @@ void AudioService::OpusCodecTask() {
                 /* lock still held – continue to next loop iteration */
             /* Software echo suppression: discard mic audio while TTS is playing or
              * queued for playback, and for 1000ms after playback stops to cover tailings.
-             * This prevents the speaker output from feeding back into the ASR pipeline when AEC hardware reference is unavailable. */
-            } else if (!audio_playback_queue_.empty() || !audio_decode_queue_.empty() ||
-                       std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - last_output_time_).count() < 1000) {
+             * This prevents the speaker output from feeding back into the ASR pipeline
+             * when AEC hardware reference is unavailable.
+             * When keep_uplink_ is set (server-side barge-in mode), mic audio is forwarded
+             * to the server even during playback so the server can perform VAD/ASR and
+             * decide whether to interrupt the current TTS. */
+            } else if (!keep_uplink_ &&
+                       (!audio_playback_queue_.empty() || !audio_decode_queue_.empty() ||
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - last_output_time_).count() < 1000)) {
                 audio_encode_queue_.pop_front();
                 audio_queue_cv_.notify_all();
                 /* lock still held – continue to next loop iteration */
