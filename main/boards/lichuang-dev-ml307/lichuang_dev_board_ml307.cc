@@ -14,6 +14,7 @@
 #include "lvgl_theme.h"
 
 #include <atomic>
+#include <functional>
 #include <limits>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -28,6 +29,7 @@
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <src/misc/lv_text_private.h>
 #include <font_awesome.h>
 #include <wifi_manager.h>
 
@@ -78,6 +80,32 @@ public:
     }
 };
 
+class BoardLcdDisplay : public SpiLcdDisplay {
+private:
+    std::shared_ptr<LvglFont> ReadThemeTextFont() {
+        auto* theme = dynamic_cast<LvglTheme*>(GetTheme());
+        return theme ? theme->text_font() : nullptr;
+    }
+
+    // Initialized before startup tasks run; later updates use the LVGL lock.
+    std::shared_ptr<LvglFont> applied_text_font_ = ReadThemeTextFont();
+
+public:
+    using SpiLcdDisplay::SpiLcdDisplay;
+    std::function<void()> on_theme_changed;
+
+    // Call while holding the LVGL lock. Assets can mutate the theme separately.
+    std::shared_ptr<LvglFont> AppliedTextFont() const { return applied_text_font_; }
+
+    void SetTheme(Theme* theme) override {
+        DisplayLockGuard lock(this);
+        SpiLcdDisplay::SetTheme(theme);
+        applied_text_font_ = ReadThemeTextFont();
+        // The camera overlay lives on lv_layer_top(), outside the main UI.
+        if (on_theme_changed) on_theme_changed();
+    }
+};
+
 // Keep this board's hardware mapping while using WiFi exclusively for now.
 class LichuangDevBoardML307 : public WifiBoard {
 private:
@@ -98,6 +126,9 @@ private:
     lv_obj_t* home_overlay_ = nullptr;
     lv_obj_t* preview_canvas_ = nullptr;
     lv_obj_t* photo_hint_ = nullptr;
+    std::shared_ptr<LvglFont> photo_font_;
+    std::string photo_hint_text_;
+    std::string photo_hint_fallback_;
     std::atomic<bool> preview_running_{false};
     std::atomic<uint32_t> preview_generation_{0};
     int preview_fail_count_ = 0;
@@ -186,15 +217,49 @@ private:
             lv_obj_del(home_overlay_);
             home_overlay_ = nullptr;
         }
+        // Labels must be destroyed before releasing their dynamic font.
+        photo_font_.reset();
+        photo_hint_text_.clear();
+        photo_hint_fallback_.clear();
         heap_caps_free(preview_image_buf_);
         preview_image_buf_ = nullptr;
         preview_image_size_ = 0;
         preview_img_dsc_ = {};
     }
 
-    const lv_font_t* TextFont() {
-        auto* theme = dynamic_cast<LvglTheme*>(display_->GetTheme());
-        return theme && theme->text_font() ? theme->text_font()->font() : LV_FONT_DEFAULT;
+    static bool FontSupportsText(const lv_font_t* font, const char* text) {
+        if (!font) return false;
+        uint32_t offset = 0;
+        while (text[offset]) {
+            const uint32_t letter = lv_text_encoded_next(text, &offset);
+            if (letter == '\n' || letter == '\r') continue;
+            lv_font_glyph_dsc_t glyph = {};
+            if (!letter || !lv_font_get_glyph_dsc(font, &glyph, letter, 0) ||
+                glyph.is_placeholder) return false;
+        }
+        return true;
+    }
+
+    void UpdatePhotoHintLocked() {
+        if (!photo_hint_) return;
+        const auto* font = photo_font_ ? photo_font_->font() : LV_FONT_DEFAULT;
+        const bool supported = FontSupportsText(font, photo_hint_text_.c_str());
+        // The boot font contains only basic glyphs. Keep every hint readable
+        // until the assets font is applied, including errors and held results.
+        lv_obj_set_style_text_font(photo_hint_, supported ? font : &lv_font_montserrat_14, 0);
+        lv_label_set_text(photo_hint_, supported ? photo_hint_text_.c_str() : photo_hint_fallback_.c_str());
+        ESP_LOGI(TAG, "Photo hint font: %s", supported ? "theme" : "ASCII fallback");
+    }
+
+    void RefreshPhotoFontLocked() {
+        if (!photo_hint_) return;
+        auto* lcd = dynamic_cast<BoardLcdDisplay*>(display_);
+        auto next_font = lcd ? lcd->AppliedTextFont() : nullptr;
+        if (next_font == photo_font_) return;
+        // Keep the previous font alive while LVGL replaces the label style.
+        auto previous_font = std::move(photo_font_);
+        photo_font_ = std::move(next_font);
+        UpdatePhotoHintLocked();
     }
 
     const lv_font_t* IconFont() {
@@ -202,10 +267,12 @@ private:
         return theme && theme->large_icon_font() ? theme->large_icon_font()->font() : LV_FONT_DEFAULT;
     }
 
-    void SetPhotoHint(const char* text) {
+    void SetPhotoHint(const char* text, const char* fallback) {
         if (!lvgl_port_lock(100)) return;
         if (app_mode_ == AppMode::kAiPhoto && photo_hint_) {
-            lv_label_set_text(photo_hint_, text);
+            photo_hint_text_ = text;
+            photo_hint_fallback_ = fallback;
+            UpdatePhotoHintLocked();
         }
         lvgl_port_unlock();
     }
@@ -243,13 +310,15 @@ private:
         }, LV_EVENT_CLICKED, this);
 
         photo_hint_ = lv_label_create(home_overlay_);
-        lv_label_set_text(photo_hint_, "按键拍照 / 双击返回");
+        photo_hint_text_ = "按键拍照 / 双击返回";
+        photo_hint_fallback_ = "Press to capture / Double-click to exit";
         lv_obj_set_width(photo_hint_, W - 16);
         lv_obj_set_style_text_align(photo_hint_, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_color(photo_hint_, lv_color_white(), 0);
         lv_obj_set_style_bg_color(photo_hint_, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(photo_hint_, LV_OPA_80, 0);
-        lv_obj_set_style_text_font(photo_hint_, TextFont(), 0);
+        RefreshPhotoFontLocked();
+        UpdatePhotoHintLocked();
         lv_obj_align(photo_hint_, LV_ALIGN_BOTTOM_MID, 0, -6);
 
         StartPreview();
@@ -290,7 +359,8 @@ private:
         if (generation != preview_generation_ || !preview_running_) return;
         if (++preview_fail_count_ >= kMaxPreviewFails) {
             StopPreview();
-            SetPhotoHint("预览失败，点画面重试 / 双击返回");
+            SetPhotoHint("预览失败，点画面重试 / 双击返回",
+                "Preview failed. Tap to retry / Double-click to exit");
         }
     }
 
@@ -359,12 +429,12 @@ private:
     void StartPreview() {
         if (preview_running_ || photo_task_running_ || app_mode_ != AppMode::kAiPhoto) return;
         if (!camera_task_ || !camera_) {
-            SetPhotoHint("摄像头不可用 / 双击返回");
+            SetPhotoHint("摄像头不可用 / 双击返回", "Camera unavailable / Double-click to exit");
             return;
         }
         ++preview_generation_;
         preview_running_ = true;
-        SetPhotoHint("按键拍照 / 双击返回");
+        SetPhotoHint("按键拍照 / 双击返回", "Press to capture / Double-click to exit");
         xTaskNotifyGive(camera_task_);
     }
 
@@ -464,12 +534,12 @@ private:
     void CaptureAndExplainPhoto() {
         bool expected = false;
         if (!photo_task_running_.compare_exchange_strong(expected, true)) {
-            SetPhotoHint("识图进行中 / 双击返回");
+            SetPhotoHint("识图进行中 / 双击返回", "Recognizing... / Double-click to exit");
             return;
         }
         if (!camera_task_ || !camera_) {
             photo_task_running_ = false;
-            SetPhotoHint("摄像头不可用 / 双击返回");
+            SetPhotoHint("摄像头不可用 / 双击返回", "Camera unavailable / Double-click to exit");
             return;
         }
         StopPreview();
@@ -490,7 +560,7 @@ private:
                     if (app_mode_ == AppMode::kAiPhoto) StartPreview();
                     return;
                 }
-                SetPhotoHint("拍照识图中 / 双击返回");
+                SetPhotoHint("拍照识图中 / 双击返回", "Recognizing... / Double-click to exit");
                 photo_generation_ = generation;
                 photo_requested_ = true;
                 xTaskNotifyGive(camera_task_);
@@ -533,14 +603,15 @@ private:
             }
             if (!error.empty()) {
                 StartPreview();
-                SetPhotoHint(error.c_str());
+                SetPhotoHint(error.c_str(), "Capture failed. Press to retry / Double-click to exit");
                 return;
             }
             if (result.empty()) {
                 StartPreview();
                 return;
             }
-            SetPhotoHint((result + "\n点画面继续 / 双击返回").c_str());
+            SetPhotoHint((result + "\n点画面继续 / 双击返回").c_str(),
+                "Result ready. Tap to continue / Double-click to exit");
             // Keep the spoken answer bounded to avoid a second lengthy response.
             Application::GetInstance().NotifySTT(
                 "请用中文简短播报以下识图结果，控制在100字以内：" + result);
@@ -605,9 +676,11 @@ private:
 #if CONFIG_USE_EMOTE_MESSAGE_STYLE
         display_ = new emote::EmoteDisplay(panel, panel_io, DISPLAY_WIDTH, DISPLAY_HEIGHT);
 #else
-        display_ = new SpiLcdDisplay(panel_io, panel,
+        auto* lcd = new BoardLcdDisplay(panel_io, panel,
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+        display_ = lcd;
+        lcd->on_theme_changed = [this]() { RefreshPhotoFontLocked(); };
 #endif
     }
 
@@ -706,7 +779,7 @@ private:
                             if (!photo_task_running_) {
                                 StartPreview();
                             } else {
-                                SetPhotoHint("识图进行中 / 双击返回");
+                                SetPhotoHint("识图进行中 / 双击返回", "Recognizing... / Double-click to exit");
                             }
                         } else {
                             CaptureAndExplainPhoto();
