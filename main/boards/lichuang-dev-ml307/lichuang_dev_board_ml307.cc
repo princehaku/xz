@@ -1,4 +1,4 @@
-#include "dual_network_board.h"
+#include "wifi_board.h"
 #include "codecs/box_audio_codec.h"
 #include "display/lcd_display.h"
 #include "display/emote_display.h"
@@ -78,7 +78,8 @@ public:
     }
 };
 
-class LichuangDevBoardML307 : public DualNetworkBoard {
+// Keep this board's hardware mapping while using WiFi exclusively for now.
+class LichuangDevBoardML307 : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_ = nullptr;
     Button boot_button_;
@@ -694,10 +695,8 @@ private:
         boot_button_.OnClick([this]() {
             Application::GetInstance().Schedule([this]() {
                 auto& app = Application::GetInstance();
-                if (GetNetworkType() == NetworkType::WIFI &&
-                    app.GetDeviceState() == kDeviceStateStarting) {
-                    auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
-                    wifi_board.EnterWifiConfigMode();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
                     return;
                 }
                 switch (app_mode_.load()) {
@@ -726,16 +725,18 @@ private:
             });
         });
 
-        // Double click: during startup switch network type; otherwise go back to home screen.
+        // Double click: configure WiFi during startup; otherwise return home.
         boot_button_.OnDoubleClick([this]() {
             // Invalidate a pending HTTP result immediately, before queued UI work.
             ++page_generation_;
             StopPreview();
             Application::GetInstance().Schedule([this]() {
                 auto& app = Application::GetInstance();
-                if (app.GetDeviceState() == kDeviceStateStarting ||
-                    app.GetDeviceState() == kDeviceStateWifiConfiguring) {
-                    SwitchNetworkType();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
+                    return;
+                }
+                if (app.GetDeviceState() == kDeviceStateWifiConfiguring) {
                     return;
                 }
                 // Return to home screen (re-select mode)
@@ -767,18 +768,13 @@ private:
             "End this conversation and enter WiFi configuration mode.\n"
             "**CAUTION** You must ask the user to confirm this action.",
             PropertyList(), [this](const PropertyList& properties) {
-                if (GetNetworkType() != NetworkType::WIFI) {
-                    throw std::runtime_error("Switch to WiFi before reconfiguring WiFi");
-                }
-                auto& wifi_board = static_cast<WifiBoard&>(GetCurrentBoard());
-                wifi_board.EnterWifiConfigMode();
+                EnterWifiConfigMode();
                 return true;
             });
     }
 
 public:
     LichuangDevBoardML307() :
-        DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC),
         boot_button_(BOOT_BUTTON_GPIO) {
 
         InitializeI2c();
@@ -797,6 +793,36 @@ public:
     virtual AudioCodec* GetAudioCodec() override {
         static CustomAudioCodec audio_codec(i2c_bus_, pca9557_);
         return &audio_codec;
+    }
+
+    void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        WifiBoard::SetNetworkEventCallback(
+            [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
+                auto& app = Application::GetInstance();
+                if (event == NetworkEvent::WifiConfigModeEnter) {
+                    StopPreview();
+                    ++page_generation_;
+                    app_mode_ = AppMode::kHome;
+                    app.SetKeepAlive(false);
+                    app.Schedule([this]() {
+                        // The WiFi setup instructions are drawn beneath the mode overlay.
+                        if (lvgl_port_lock(500)) {
+                            DeleteOverlayLocked();
+                            lvgl_port_unlock();
+                        }
+                    });
+                } else if (event == NetworkEvent::Connected) {
+                    app.Schedule([this]() {
+                        if (lvgl_port_lock(500)) {
+                            if (app_mode_ == AppMode::kHome && !home_overlay_) {
+                                ShowHomeScreen();
+                            }
+                            lvgl_port_unlock();
+                        }
+                    });
+                }
+                if (callback) callback(event, data);
+            });
     }
 
     virtual Display* GetDisplay() override {
