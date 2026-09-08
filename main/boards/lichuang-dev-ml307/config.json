@@ -4,7 +4,10 @@
         {
             "name": "lichuang-dev-ml307",
             "sdkconfig_append": [
-                "CONFIG_USE_DEVICE_AEC=y"
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_FATFS_LFN_HEAP=y",
+                "CONFIG_FATFS_MAX_LFN=255",
+                "CONFIG_FATFS_API_ENCODING_UTF_8=y"
             ]
         }
     ]

@@ -296,6 +296,7 @@ public:
     SpiLcdDisplay* display_ = nullptr;
     lv_obj_t *photo_hint_ = nullptr, *preview_canvas_ = nullptr, *home_overlay_ = nullptr;
     std::shared_ptr<LvglFont> photo_font_;
+    std::unique_ptr<int> music_screen_;
     std::string photo_hint_text_, photo_hint_fallback_;
     uint8_t* preview_image_buf_ = nullptr;
     size_t preview_image_size_ = 0;

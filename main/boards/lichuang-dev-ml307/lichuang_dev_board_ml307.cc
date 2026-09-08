@@ -10,9 +10,12 @@
 #include "mcp_server.h"
 #include "settings.h"
 #include "assets/lang_config.h"
-#include "led/single_led.h"
+#include "led/led.h"
 #include "lvgl_theme.h"
+#include "sd_music_player.h"
+#include "sd_music_screen.h"
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <limits>
@@ -120,7 +123,7 @@ private:
     std::atomic<uint32_t> photo_generation_{0};
     TaskHandle_t camera_task_ = nullptr;
 
-    enum class AppMode { kHome, kAiGuide, kAiPhoto };
+    enum class AppMode { kHome, kAiGuide, kAiPhoto, kMusic };
     std::atomic<AppMode> app_mode_{AppMode::kHome};
     std::atomic<uint32_t> page_generation_{0};
     lv_obj_t* home_overlay_ = nullptr;
@@ -129,6 +132,8 @@ private:
     std::shared_ptr<LvglFont> photo_font_;
     std::string photo_hint_text_;
     std::string photo_hint_fallback_;
+    std::unique_ptr<SdMusicPlayer> music_player_;
+    std::unique_ptr<SdMusicScreen> music_screen_;
     std::atomic<bool> preview_running_{false};
     std::atomic<uint32_t> preview_generation_{0};
     int preview_fail_count_ = 0;
@@ -209,10 +214,98 @@ private:
         self->ShowPhotoPreview();
     }
 
+    static void HomeScreenMusicClicked(lv_event_t* e) {
+        auto* self = static_cast<LichuangDevBoardML307*>(lv_event_get_user_data(e));
+        self->EnterMusic();
+    }
+
+    void EnterMusic() {
+        if (!lvgl_port_lock(500)) return;
+        StopPreview();
+        DeleteOverlayLocked();
+        app_mode_ = AppMode::kMusic;
+        const uint32_t generation = ++page_generation_;
+        ShowMusicScreenLocked();
+        lvgl_port_unlock();
+        auto& app = Application::GetInstance();
+        const auto state = app.GetDeviceState();
+        if (state == kDeviceStateIdle || state == kDeviceStateConnecting ||
+            state == kDeviceStateListening || state == kDeviceStateSpeaking) app.EndConversation();
+        else app.SetKeepAlive(false);
+        // Start only after queued conversation cleanup, including decoder reset.
+        app.Schedule([this, generation]() {
+            if (page_generation_ == generation && app_mode_ == AppMode::kMusic) {
+                music_player_->Start();
+            }
+        });
+    }
+
+    void ReturnHome() {
+        const uint32_t generation = ++page_generation_;
+        StopPreview();
+        if (music_player_) music_player_->Stop();
+        app_mode_ = AppMode::kHome;
+        auto& app = Application::GetInstance();
+        const auto state = app.GetDeviceState();
+        if (state == kDeviceStateIdle || state == kDeviceStateConnecting ||
+            state == kDeviceStateListening || state == kDeviceStateSpeaking) app.EndConversation();
+        else app.SetKeepAlive(false);
+        app.Schedule([this, generation]() {
+            auto& app = Application::GetInstance();
+            if (page_generation_ == generation && app_mode_ == AppMode::kHome &&
+                app.GetDeviceState() == kDeviceStateIdle) {
+                app.GetAudioService().EnableWakeWordDetection(true);
+            }
+        });
+        if (lvgl_port_lock(500)) {
+            DeleteOverlayLocked();
+            if (app.GetDeviceState() == kDeviceStateWifiConfiguring) {
+                display_->ShowNotification("BOOT: SD Music", 10000);
+            } else {
+                ShowHomeScreen();
+            }
+            lvgl_port_unlock();
+        }
+    }
+
+    void ShowMusicScreenLocked() {
+        home_overlay_ = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(home_overlay_);
+        lv_obj_set_size(home_overlay_, LV_HOR_RES, LV_VER_RES);
+        lv_obj_set_pos(home_overlay_, 0, 0);
+        lv_obj_set_style_bg_opa(home_overlay_, LV_OPA_COVER, 0);
+        lv_obj_clear_flag(home_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+        SdMusicScreen::Actions actions;
+        actions.back = [this]() {
+            const uint32_t generation = ++page_generation_;
+            Application::GetInstance().Schedule([this, generation]() {
+                if (page_generation_ == generation && app_mode_ == AppMode::kMusic) ReturnHome();
+            });
+        };
+        actions.previous = [this]() { music_player_->Previous(); };
+        actions.toggle = [this]() { music_player_->TogglePause(); };
+        actions.next = [this]() { music_player_->Next(); };
+        actions.rescan = [this]() { music_player_->Rescan(); };
+        actions.volume = [this](int delta) {
+            const uint32_t generation = page_generation_;
+            Application::GetInstance().Schedule([this, delta, generation]() {
+                if (page_generation_ != generation || app_mode_ != AppMode::kMusic) return;
+                auto* codec = GetAudioCodec();
+                codec->SetOutputVolume(std::clamp(codec->output_volume() + delta, 0, 100));
+            });
+        };
+        actions.get_volume = [this]() { return GetAudioCodec()->output_volume(); };
+        music_screen_ = std::make_unique<SdMusicScreen>(home_overlay_, *music_player_, std::move(actions));
+        auto* lcd = dynamic_cast<BoardLcdDisplay*>(display_);
+        if (lcd) music_screen_->SetFont(lcd->AppliedTextFont());
+    }
+
     // Call only while holding the LVGL lock (including LVGL event callbacks).
     void DeleteOverlayLocked() {
         preview_canvas_ = nullptr;
         photo_hint_ = nullptr;
+        // Retain the screen/font until LVGL has destroyed all of its labels.
+        auto previous_music_screen = std::move(music_screen_);
         if (home_overlay_) {
             lv_obj_del(home_overlay_);
             home_overlay_ = nullptr;
@@ -453,6 +546,7 @@ private:
         const int W = LV_HOR_RES;   // 320
         const int H = LV_VER_RES;   // 240
         const int MID = W / 2;      // 160
+        const int top_height = H - 60;
 
         // Full-screen overlay sits on top of whatever the display shows
         home_overlay_ = lv_obj_create(lv_layer_top());
@@ -466,7 +560,7 @@ private:
         // ── Left zone: CALL (phone mode, dark blue) ──
         lv_obj_t* left = lv_obj_create(home_overlay_);
         lv_obj_remove_style_all(left);
-        lv_obj_set_size(left, MID - 1, H);
+        lv_obj_set_size(left, MID - 1, top_height);
         lv_obj_set_pos(left, 0, 0);
         lv_obj_set_style_bg_color(left, lv_color_hex(0x1A237E), 0);
         lv_obj_set_style_bg_opa(left, LV_OPA_COVER, 0);
@@ -494,7 +588,7 @@ private:
         // ── Center divider ──
         lv_obj_t* div = lv_obj_create(home_overlay_);
         lv_obj_remove_style_all(div);
-        lv_obj_set_size(div, 2, H);
+        lv_obj_set_size(div, 2, top_height);
         lv_obj_set_pos(div, MID - 1, 0);
         lv_obj_set_style_bg_color(div, lv_color_hex(0x333355), 0);
         lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
@@ -502,7 +596,7 @@ private:
         // ── Right zone: 百科相机 (static, like left side) ──
         lv_obj_t* right = lv_obj_create(home_overlay_);
         lv_obj_remove_style_all(right);
-        lv_obj_set_size(right, W - MID - 1, H);
+        lv_obj_set_size(right, W - MID - 1, top_height);
         lv_obj_set_pos(right, MID + 1, 0);
         lv_obj_set_style_bg_color(right, lv_color_hex(0x004D40), 0);
         lv_obj_set_style_bg_opa(right, LV_OPA_COVER, 0);
@@ -526,6 +620,20 @@ private:
         lv_obj_set_style_text_align(r_title, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(r_title, &lv_font_montserrat_24, 0);
         lv_obj_align(r_title, LV_ALIGN_CENTER, 0, 5);
+
+        auto* music = lv_button_create(home_overlay_);
+        lv_obj_set_pos(music, 0, top_height + 2);
+        lv_obj_set_size(music, W, H - top_height - 2);
+        lv_obj_set_style_radius(music, 0, 0);
+        lv_obj_set_style_shadow_width(music, 0, 0);
+        lv_obj_set_style_bg_color(music, lv_color_hex(0x353052), 0);
+        lv_obj_set_style_bg_color(music, lv_color_hex(0x524873), LV_STATE_PRESSED);
+        lv_obj_add_event_cb(music, HomeScreenMusicClicked, LV_EVENT_CLICKED, this);
+        auto* music_title = lv_label_create(music);
+        lv_obj_set_style_text_font(music_title, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(music_title, lv_color_white(), 0);
+        lv_label_set_text(music_title, "SD Music");
+        lv_obj_center(music_title);
 
         lvgl_port_unlock();
         ESP_LOGI(TAG, "Home screen shown");
@@ -680,7 +788,10 @@ private:
             DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
         display_ = lcd;
-        lcd->on_theme_changed = [this]() { RefreshPhotoFontLocked(); };
+        lcd->on_theme_changed = [this, lcd]() {
+            RefreshPhotoFontLocked();
+            if (music_screen_) music_screen_->SetFont(lcd->AppliedTextFont());
+        };
 #endif
     }
 
@@ -768,11 +879,18 @@ private:
         boot_button_.OnClick([this]() {
             Application::GetInstance().Schedule([this]() {
                 auto& app = Application::GetInstance();
-                if (app.GetDeviceState() == kDeviceStateStarting) {
+                if (app.GetDeviceState() == kDeviceStateWifiConfiguring && app_mode_ == AppMode::kHome) {
+                    EnterMusic();
+                    return;
+                }
+                if (app.GetDeviceState() == kDeviceStateStarting && app_mode_ == AppMode::kHome) {
                     EnterWifiConfigMode();
                     return;
                 }
                 switch (app_mode_.load()) {
+                    case AppMode::kMusic:
+                        music_player_->TogglePause();
+                        break;
                     case AppMode::kAiPhoto:
                         ESP_LOGI(TAG, "Button: kAiPhoto state=%d", (int)app.GetDeviceState());
                         if (!preview_running_) {
@@ -792,7 +910,7 @@ private:
                     case AppMode::kHome:
                     default:
                         ESP_LOGW(TAG, "Button: kHome - mode not selected yet");
-                        if (display_) display_->ShowNotification("请先选择左侧或右侧功能区");
+                        if (display_) display_->ShowNotification("请先选择主页功能");
                         break;
                 }
             });
@@ -805,21 +923,14 @@ private:
             StopPreview();
             Application::GetInstance().Schedule([this]() {
                 auto& app = Application::GetInstance();
-                if (app.GetDeviceState() == kDeviceStateStarting) {
+                if (app.GetDeviceState() == kDeviceStateStarting && app_mode_ == AppMode::kHome) {
                     EnterWifiConfigMode();
                     return;
                 }
-                if (app.GetDeviceState() == kDeviceStateWifiConfiguring) {
+                if (app.GetDeviceState() == kDeviceStateWifiConfiguring && app_mode_ == AppMode::kHome) {
                     return;
                 }
-                // Return to home screen (re-select mode)
-                app_mode_ = AppMode::kHome;
-                app.EndConversation();
-                if (lvgl_port_lock(500)) {
-                    DeleteOverlayLocked();
-                    ShowHomeScreen();
-                    lvgl_port_unlock();
-                }
+                ReturnHome();
             });
         });
 
@@ -856,6 +967,7 @@ public:
         InitializeTouch();
         InitializeCamera();
         InitializeCameraWorker();
+        music_player_ = std::make_unique<SdMusicPlayer>(Application::GetInstance().GetAudioService());
         InitializeButtons();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
@@ -872,15 +984,19 @@ public:
         WifiBoard::SetNetworkEventCallback(
             [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
                 auto& app = Application::GetInstance();
-                if (event == NetworkEvent::WifiConfigModeEnter) {
+                if (event == NetworkEvent::WifiConfigModeEnter && app_mode_ != AppMode::kMusic) {
                     StopPreview();
+                    if (music_player_) music_player_->Stop();
                     ++page_generation_;
                     app_mode_ = AppMode::kHome;
                     app.SetKeepAlive(false);
                     app.Schedule([this]() {
                         // The WiFi setup instructions are drawn beneath the mode overlay.
                         if (lvgl_port_lock(500)) {
-                            DeleteOverlayLocked();
+                            if (app_mode_ != AppMode::kMusic) {
+                                DeleteOverlayLocked();
+                                display_->ShowNotification("BOOT: SD Music", 10000);
+                            }
                             lvgl_port_unlock();
                         }
                     });
@@ -912,7 +1028,8 @@ public:
     }
 
     virtual Led* GetLed() override {
-        static SingleLed led(BUILTIN_LED_GPIO);
+        // GPIO48 belongs to the onboard SD card CMD line.
+        static NoLed led;
         return &led;
     }
 };

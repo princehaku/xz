@@ -89,12 +89,14 @@ enum AudioTaskType {
     kAudioTaskTypeEncodeToSendQueue,
     kAudioTaskTypeEncodeToTestingQueue,
     kAudioTaskTypeDecodeToPlaybackQueue,
+    kAudioTaskTypeLocalPlayback,
 };
 
 struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
     uint32_t timestamp = 0;
+    uint32_t generation = 0;
 };
 
 struct DebugStatistics {
@@ -137,6 +139,13 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void ResetEncoder();
+    // Local PCM is mono int16 at codec_->output_sample_rate(), at most 20 ms per block.
+    // A failed enqueue leaves pcm intact. Tokens remain exclusive while paused.
+    uint32_t BeginLocalPlayback();
+    bool PushLocalPcm(uint32_t token, std::vector<int16_t>& pcm);
+    void PauseLocalPlayback(uint32_t token, bool paused);
+    void EndLocalPlayback(uint32_t token);
+    bool IsLocalPlaybackActive() const { return local_playback_token_.load() != 0; }
     void SetModelsList(srmodel_list_t* models_list);
 
 private:
@@ -170,6 +179,10 @@ private:
     TaskHandle_t audio_output_task_handle_ = nullptr;
     TaskHandle_t opus_codec_task_handle_ = nullptr;
     std::mutex audio_queue_mutex_;
+    // Never acquire these while holding audio_queue_mutex_. Source changes clear
+    // queued frames first, then wait for the current I2S write with no queue lock.
+    std::mutex output_mutex_;
+    std::mutex input_control_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_send_queue_;
@@ -177,6 +190,9 @@ private:
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
     std::atomic<uint32_t> decode_generation_{0};
+    std::atomic<uint32_t> local_playback_token_{0};
+    uint32_t local_playback_sequence_ = 0;
+    bool local_playback_paused_ = false;
     uint32_t encode_generation_ = 0;
     bool decoding_ = false;
     bool playing_ = false;
@@ -198,6 +214,7 @@ private:
     void AudioOutputTask();
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    bool EnqueueDecodePacket(std::unique_ptr<AudioStreamPacket> packet, bool wait, uint32_t generation);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
 };

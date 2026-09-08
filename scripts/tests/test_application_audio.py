@@ -78,7 +78,7 @@ int esp_opus_enc_process(void*, esp_audio_enc_in_frame_t*, esp_audio_enc_out_fra
 int esp_opus_dec_reset(void*) { return 0; }
 void esp_ae_rate_cvt_get_max_out_sample_num(void*, size_t n, uint32_t* out) { *out = n; }
 void esp_ae_rate_cvt_process(void*, void*, size_t, void*, uint32_t*) {}
-enum AudioTaskType { kAudioTaskTypeEncodeToSendQueue, kAudioTaskTypeEncodeToTestingQueue, kAudioTaskTypeDecodeToPlaybackQueue };
+enum AudioTaskType { kAudioTaskTypeEncodeToSendQueue, kAudioTaskTypeEncodeToTestingQueue, kAudioTaskTypeDecodeToPlaybackQueue, kAudioTaskTypeLocalPlayback };
 struct AudioTask { AudioTaskType type; std::vector<int16_t> pcm; uint32_t timestamp = 0; };
 struct AudioStreamPacket { int sample_rate = 16000; int frame_duration = 20; uint32_t timestamp = 0; std::vector<uint8_t> payload; };
 struct FakeCodec {
@@ -89,12 +89,14 @@ struct FakeCodec {
     void OutputData(std::vector<int16_t>&) { if (output_hook) output_hook(); }
 };
 struct AudioService {
-    std::mutex audio_queue_mutex_, decoder_mutex_;
+    std::mutex audio_queue_mutex_, decoder_mutex_, output_mutex_;
     std::condition_variable audio_queue_cv_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_, audio_playback_queue_;
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_decode_queue_, audio_send_queue_, audio_testing_queue_;
     std::deque<uint32_t> timestamp_queue_;
     std::atomic<uint32_t> decode_generation_{0}; uint32_t encode_generation_ = 0;
+    std::atomic<uint32_t> local_playback_token_{0}; bool local_playback_paused_ = false;
+    bool IsLocalPlaybackActive() const { return local_playback_token_.load() != 0; }
     std::atomic<bool> service_stopped_{false}, keep_uplink_{false};
     bool decoding_ = false, playing_ = false, processing = false, speaking = false;
     std::chrono::steady_clock::time_point last_output_time_ = std::chrono::steady_clock::now() - 1s;
@@ -113,6 +115,7 @@ struct AudioService {
     void ResetDecoder(); void ResetEncoder(); bool IsPlaybackComplete();
     void OpusCodecTask(); void AudioOutputTask();
     bool PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket>,bool);
+    bool EnqueueDecodePacket(std::unique_ptr<AudioStreamPacket>,bool,uint32_t);
     void PushTaskToEncodeQueue(AudioTaskType,std::vector<int16_t>&&);
 };
 enum DeviceState { kDeviceStateIdle, kDeviceStateConnecting, kDeviceStateListening, kDeviceStateSpeaking };
@@ -306,7 +309,7 @@ audio_header = (repo / "main/audio/audio_service.h").read_text(encoding="utf-8")
 audio_task = re.search(r"struct AudioTask\s*\{[\s\S]*?\n\};", audio_header).group()
 head = re.sub(r"struct AudioTask \{[^\n]*\};", lambda _: audio_task, head)
 parts = [head]
-for name in ["ResetDecoder", "ResetEncoder", "IsPlaybackComplete", "OpusCodecTask", "AudioOutputTask", "PushPacketToDecodeQueue", "PushTaskToEncodeQueue"]:
+for name in ["ResetDecoder", "ResetEncoder", "IsPlaybackComplete", "OpusCodecTask", "AudioOutputTask", "PushPacketToDecodeQueue", "EnqueueDecodePacket", "PushTaskToEncodeQueue"]:
     parts.append(method("main/audio/audio_service.cc", "AudioService::" + name))
 for name in ["ScheduleReconnect", "HandleReconnect", "CancelTtsCompletion", "HandlePlaybackProgress", "NotifySTT", "EndConversation", "AbortSpeaking", "SetKeepAlive"]:
     parts.append(method("main/application.cc", "Application::" + name))

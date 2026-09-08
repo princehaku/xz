@@ -21,10 +21,16 @@
 #define AUDIO_CODEC_ES7210_ADDR 0x82
 
 // ===================== 按键 / LED =====================
-#define BUILTIN_LED_GPIO GPIO_NUM_48
+// GPIO48 is the onboard TF card CMD signal, so it cannot drive a status LED.
+#define BUILTIN_LED_GPIO GPIO_NUM_NC
 #define BOOT_BUTTON_GPIO GPIO_NUM_0
 #define VOLUME_UP_BUTTON_GPIO GPIO_NUM_NC
 #define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
+
+// ===================== 板载 TF 卡（SDMMC 1-bit）=====================
+#define SD_MMC_CLK_GPIO GPIO_NUM_47
+#define SD_MMC_CMD_GPIO GPIO_NUM_48
+#define SD_MMC_D0_GPIO GPIO_NUM_21
 
 // ===================== 显示屏 =====================
 #define DISPLAY_WIDTH 320

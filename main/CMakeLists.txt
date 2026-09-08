@@ -906,11 +906,17 @@ if(CONFIG_IDF_TARGET_ESP32S3)
     list(APPEND SOURCES "boards/common/esp32_camera.cc")
 endif()
 
+set(BOARD_STORAGE_REQUIRES)
+if(CONFIG_BOARD_TYPE_LICHUANG_DEV_ML307)
+    list(APPEND BOARD_STORAGE_REQUIRES esp_driver_sdmmc sdmmc)
+endif()
+
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
                     WHOLE_ARCHIVE
                     PRIV_REQUIRES
+                        ${BOARD_STORAGE_REQUIRES}
                         esp_pm
                         esp_psram
                         esp_netif

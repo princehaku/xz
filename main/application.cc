@@ -906,7 +906,7 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
-    if (!protocol_) {
+    if (!protocol_ || audio_service_.IsLocalPlaybackActive()) {
         return;
     }
 
