@@ -20,6 +20,7 @@
 
 #define MQTT_PING_INTERVAL_SECONDS 90
 #define MQTT_RECONNECT_INTERVAL_MS 60000
+#define MQTT_RECONNECT_MAX_INTERVAL_MS 600000
 
 #define MQTT_PROTOCOL_SERVER_HELLO_EVENT (1 << 0)
 
@@ -49,11 +50,18 @@ private:
     mbedtls_aes_context aes_ctx_;
     std::string aes_nonce_;
     std::string udp_server_;
-    int udp_port_;
-    uint32_t local_sequence_;
-    uint32_t remote_sequence_;
-    esp_timer_handle_t reconnect_timer_;
+    int udp_port_ = 0;
+    uint32_t local_sequence_ = 0;
+    uint32_t remote_sequence_ = 0;
+    esp_timer_handle_t reconnect_timer_ = nullptr;
+    uintptr_t reconnect_id_ = 0;
+    std::mutex reconnect_mutex_;
+    uint32_t reconnect_delay_ms_ = MQTT_RECONNECT_INTERVAL_MS;
+    std::atomic<bool> mqtt_connected_{false};
 
+    void ScheduleReconnect();
+    void ResetReconnect();
+    void RetryConnection();
     bool StartMqttClient(bool report_error=false);
     void ParseServerHello(const cJSON* root);
     std::string DecodeHexString(const std::string& hex_string);

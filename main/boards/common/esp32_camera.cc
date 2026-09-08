@@ -3,6 +3,10 @@
 #include <esp_heap_caps.h>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <algorithm>
 #include <esp_log.h>
 #include <img_converters.h>
 
@@ -26,10 +30,13 @@ Esp32Camera::Esp32Camera(const camera_config_t &config) {
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
+        ESP_LOGI(TAG, "Camera sensor detected, PID=0x%04x", s->id.PID);
         if (s->id.PID == GC0308_PID) {
             s->set_hmirror(s, 0); // Control camera mirror: 1 for mirror, 0 for normal
         }
         ESP_LOGI(TAG, "Camera initialized: format=%d", config.pixel_format);
+    } else {
+        ESP_LOGE(TAG, "No camera sensor detected after esp_camera_init");
     }
 
     streaming_on_ = true;
@@ -37,10 +44,7 @@ Esp32Camera::Esp32Camera(const camera_config_t &config) {
 
 Esp32Camera::~Esp32Camera() {
     if (streaming_on_) {
-        if (current_fb_) {
-            esp_camera_fb_return(current_fb_);
-            current_fb_ = nullptr;
-        }
+        ReturnFrame();
         if (encode_buf_) {
             heap_caps_free(encode_buf_);
             encode_buf_ = nullptr;
@@ -52,24 +56,32 @@ Esp32Camera::~Esp32Camera() {
 }
 
 void Esp32Camera::SetExplainUrl(const std::string &url, const std::string &token) {
+    std::lock_guard<std::mutex> lock(explain_mutex_);
     explain_url_ = url;
     explain_token_ = token;
 }
 
 bool Esp32Camera::Capture() {
-    if (encoder_thread_.joinable()) {
-        encoder_thread_.join();
-    }
+    return Capture(true);
+}
 
+bool Esp32Camera::Capture(bool show_preview) {
+    if (!TryAcquire()) {
+        ESP_LOGW(TAG, "Camera is busy");
+        return false;
+    }
+    struct CaptureGuard {
+        Esp32Camera* camera;
+        bool captured = false;
+        ~CaptureGuard() { if (!captured) camera->ReleaseFrame(); }
+    } guard{this};
     if (!streaming_on_) {
         return false;
     }
 
     // Get the latest frame, discard old frames for real-time performance
     for (int i = 0; i < 2; i++) {
-        if (current_fb_) {
-            esp_camera_fb_return(current_fb_);
-        }
+        ReturnFrame();
         current_fb_ = esp_camera_fb_get();
         if (!current_fb_) {
             ESP_LOGE(TAG, "Camera capture failed");
@@ -77,10 +89,28 @@ bool Esp32Camera::Capture() {
         }
     }
 
+    if (current_fb_->buf == nullptr || current_fb_->len == 0 ||
+        current_fb_->width == 0 || current_fb_->height == 0 ||
+        current_fb_->width > std::numeric_limits<uint16_t>::max() ||
+        current_fb_->height > std::numeric_limits<uint16_t>::max()) {
+        ESP_LOGE(TAG, "Invalid camera frame");
+        ReleaseFrame();
+        return false;
+    }
+
     // Prepare encode buffer for RGB565 format (with optional byte swapping)
     if (current_fb_->format == PIXFORMAT_RGB565) {
+        if (current_fb_->height > std::numeric_limits<size_t>::max() / current_fb_->width / 2) {
+            ESP_LOGE(TAG, "RGB565 frame size overflow");
+            return false;
+        }
         size_t pixel_count = current_fb_->width * current_fb_->height;
         size_t data_size = pixel_count * 2;
+        if (current_fb_->len < data_size) {
+            ESP_LOGE(TAG, "Truncated RGB565 camera frame");
+            ReleaseFrame();
+            return false;
+        }
 
         // Allocate or reallocate encode buffer if needed
         if (encode_buf_size_ < data_size) {
@@ -91,6 +121,7 @@ bool Esp32Camera::Capture() {
             if (encode_buf_ == nullptr) {
                 ESP_LOGE(TAG, "Failed to allocate memory for encode buffer");
                 encode_buf_size_ = 0;
+                ReleaseFrame();
                 return false;
             }
             encode_buf_size_ = data_size;
@@ -117,7 +148,8 @@ bool Esp32Camera::Capture() {
         }
 
         // Allocate separate buffer for preview display
-        uint8_t *preview_data = (uint8_t *)heap_caps_malloc(preview_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        uint8_t *preview_data = show_preview ?
+            (uint8_t *)heap_caps_malloc(preview_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : nullptr;
         if (preview_data != nullptr) {
             if (!preview_rotate_90_enabled_) {
                 memcpy(preview_data, encode_buf_, data_size);
@@ -161,7 +193,28 @@ bool Esp32Camera::Capture() {
     ESP_LOGI(TAG, "Captured frame: %dx%d, len=%zu, format=%d",
              current_fb_->width, current_fb_->height, current_fb_->len, current_fb_->format);
 
+    guard.captured = true;
     return true;
+}
+
+bool Esp32Camera::TryAcquire() {
+    auto task = xTaskGetCurrentTaskHandle();
+    TaskHandle_t expected = nullptr;
+    return owner_task_.compare_exchange_strong(expected, task) || expected == task;
+}
+
+void Esp32Camera::ReturnFrame() {
+    if (current_fb_ != nullptr) {
+        esp_camera_fb_return(current_fb_);
+        current_fb_ = nullptr;
+    }
+}
+
+void Esp32Camera::ReleaseFrame() {
+    if (owner_task_.load() == xTaskGetCurrentTaskHandle()) {
+        ReturnFrame();
+        owner_task_ = nullptr;
+    }
 }
 
 bool Esp32Camera::SetHMirror(bool enabled) {
@@ -193,171 +246,142 @@ void Esp32Camera::SetPreviewRotation(bool rotate_90, bool clockwise) {
 }
 
 std::string Esp32Camera::Explain(const std::string &question) {
-    if (explain_url_.empty()) {
-        throw std::runtime_error("Image explain URL or token is not set");
+    if (!TryAcquire()) {
+        throw std::runtime_error("Camera is busy");
     }
+    // Every exit returns the single driver buffer, including exceptions.
+    struct FrameGuard {
+        Esp32Camera* camera;
+        ~FrameGuard() { camera->ReleaseFrame(); }
+    } frame_guard{this};
 
+    std::string explain_url;
+    std::string explain_token;
+    {
+        std::lock_guard<std::mutex> lock(explain_mutex_);
+        explain_url = explain_url_;
+        explain_token = explain_token_;
+    }
+    if (explain_url.empty()) {
+        throw std::runtime_error("Image explain URL is not set");
+    }
     if (current_fb_ == nullptr) {
         throw std::runtime_error("No camera frame captured");
     }
 
-    // Create local JPEG queue
-    QueueHandle_t jpeg_queue = xQueueCreate(40, sizeof(JpegChunk));
-    if (jpeg_queue == nullptr) {
-        ESP_LOGE(TAG, "Failed to create JPEG queue");
-        throw std::runtime_error("Failed to create JPEG queue");
+    const uint16_t width = current_fb_->width;
+    const uint16_t height = current_fb_->height;
+    v4l2_pix_fmt_t format;
+    switch (current_fb_->format) {
+        case PIXFORMAT_RGB565: format = V4L2_PIX_FMT_RGB565; break;
+        case PIXFORMAT_YUV422: format = V4L2_PIX_FMT_YUYV; break;
+        case PIXFORMAT_YUV420: format = V4L2_PIX_FMT_YUV420; break;
+        case PIXFORMAT_GRAYSCALE: format = V4L2_PIX_FMT_GREY; break;
+        case PIXFORMAT_JPEG: format = V4L2_PIX_FMT_JPEG; break;
+        case PIXFORMAT_RGB888: format = V4L2_PIX_FMT_RGB24; break;
+        default: throw std::runtime_error("Unsupported camera pixel format");
     }
 
-    // Start encoding thread
-    encoder_thread_ = std::thread([this, jpeg_queue]() {
-        int64_t start_time = esp_timer_get_time();
-        uint16_t w = current_fb_->width;
-        uint16_t h = current_fb_->height;
-        v4l2_pix_fmt_t enc_fmt;
-        switch (current_fb_->format) {
-            case PIXFORMAT_RGB565:
-                enc_fmt = V4L2_PIX_FMT_RGB565;
-                break;
-            case PIXFORMAT_YUV422:
-                enc_fmt = V4L2_PIX_FMT_YUYV;  // YUV422 is actually YUYV format
-                break;
-            case PIXFORMAT_YUV420:
-                enc_fmt = V4L2_PIX_FMT_YUV420;
-                break;
-            case PIXFORMAT_GRAYSCALE:
-                enc_fmt = V4L2_PIX_FMT_GREY;
-                break;
-            case PIXFORMAT_JPEG:
-                enc_fmt = V4L2_PIX_FMT_JPEG;
-                break;
-            case PIXFORMAT_RGB888:
-                enc_fmt = V4L2_PIX_FMT_RGB24;
-                break;
-            default:
-                ESP_LOGE(TAG, "Unsupported pixel format: %d", current_fb_->format);
-                return;
-        }
+    uint8_t* source = current_fb_->buf;
+    size_t source_size = current_fb_->len;
+    if (current_fb_->format == PIXFORMAT_RGB565 && encode_buf_ != nullptr) {
+        source = encode_buf_;
+        source_size = static_cast<size_t>(width) * height * 2;
+    }
 
-        // Use encode buffer for RGB565, otherwise use original frame buffer
-        uint8_t *jpeg_src_buf = current_fb_->buf;
-        size_t jpeg_src_len = current_fb_->len;
-        if (current_fb_->format == PIXFORMAT_RGB565 && encode_buf_ != nullptr) {
-            jpeg_src_buf = encode_buf_;
-            jpeg_src_len = encode_buf_size_;
-        }
-
-        bool ok = image_to_jpeg_cb(jpeg_src_buf, jpeg_src_len, w, h, enc_fmt, 60,
-            [](void* arg, size_t index, const void* data, size_t len) -> size_t {
-                auto jpeg_queue = static_cast<QueueHandle_t>(arg);
-                JpegChunk chunk = {.data = nullptr, .len = len};
-                (void)index;
-                if (data != nullptr && len > 0) {
-                    chunk.data = (uint8_t*)heap_caps_aligned_alloc(16, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                    if (chunk.data == nullptr) {
-                        ESP_LOGE(TAG, "Failed to allocate %zu bytes for JPEG chunk", len);
-                        chunk.len = 0;
-                    } else {
-                        memcpy(chunk.data, data, len);
-                    }
-                } else {
-                    chunk.len = 0;  // Sentinel or error
-                }
-                xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
-                return len;
-            }, jpeg_queue);
-
-        if (!ok) {
-            JpegChunk chunk = {.data = nullptr, .len = 0};
-            xQueueSend(jpeg_queue, &chunk, portMAX_DELAY);
-        }
-        int64_t end_time = esp_timer_get_time();
-        ESP_LOGI(TAG, "JPEG encoding time: %ld ms", int((end_time - start_time) / 1000));
-    });
+    // The encoder already produces a complete JPEG. Take ownership directly
+    // instead of copying it through an extra thread and a blocking chunk queue.
+    uint8_t* jpeg_data = nullptr;
+    size_t jpeg_size = 0;
+    bool encoded = image_to_jpeg(source, source_size, width, height, format, 60,
+                                 &jpeg_data, &jpeg_size);
+    std::unique_ptr<uint8_t, decltype(&free)> jpeg(jpeg_data, &free);
+    if (!encoded || jpeg == nullptr || jpeg_size == 0) {
+        throw std::runtime_error("Failed to encode image to JPEG");
+    }
+    ReturnFrame();
 
     auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        throw std::runtime_error("Network is not available");
+    }
     auto http = network->CreateHttp(3);
-    std::string boundary = "----ESP32_CAMERA_BOUNDARY";
+    if (http == nullptr) {
+        throw std::runtime_error("Failed to create image upload connection");
+    }
+    struct HttpGuard {
+        Http* http;
+        ~HttpGuard() { http->Close(); }
+    } http_guard{http.get()};
 
+    const std::string boundary = "----ESP32_CAMERA_BOUNDARY";
+    http->SetTimeout(30000);
     http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
     http->SetHeader("Client-Id", Board::GetInstance().GetUuid().c_str());
-    if (!explain_token_.empty()) {
-        http->SetHeader("Authorization", "Bearer " + explain_token_);
+    if (!explain_token.empty()) {
+        http->SetHeader("Authorization", "Bearer " + explain_token);
     }
     http->SetHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
     http->SetHeader("Transfer-Encoding", "chunked");
-    if (!http->Open("POST", explain_url_)) {
-        ESP_LOGE(TAG, "Failed to connect to explain URL");
-        encoder_thread_.join();
-        JpegChunk chunk;
-        while (xQueueReceive(jpeg_queue, &chunk, portMAX_DELAY) == pdPASS) {
-            if (chunk.data != nullptr) {
-                heap_caps_free(chunk.data);
-            } else {
-                break;
-            }
-        }
-        vQueueDelete(jpeg_queue);
+    if (!http->Open("POST", explain_url)) {
         throw std::runtime_error("Failed to connect to explain URL");
     }
 
-    {
-        std::string question_field;
-        question_field += "--" + boundary + "\r\n";
-        question_field += "Content-Disposition: form-data; name=\"question\"\r\n";
-        question_field += "\r\n";
-        question_field += question + "\r\n";
-        http->Write(question_field.c_str(), question_field.size());
-    }
-    {
-        std::string file_header;
-        file_header += "--" + boundary + "\r\n";
-        file_header += "Content-Disposition: form-data; name=\"file\"; filename=\"camera.jpg\"\r\n";
-        file_header += "Content-Type: image/jpeg\r\n";
-        file_header += "\r\n";
-        http->Write(file_header.c_str(), file_header.size());
-    }
-
-    size_t total_sent = 0;
-    bool saw_terminator = false;
-    while (true) {
-        JpegChunk chunk;
-        if (xQueueReceive(jpeg_queue, &chunk, portMAX_DELAY) != pdPASS) {
-            ESP_LOGE(TAG, "Failed to receive JPEG chunk");
-            break;
+    auto write_chunk = [&http](const char* data, size_t size) {
+        // HttpClient counts chunk framing bytes; ML307 counts payload bytes.
+        // A short write is fatal: retrying a partial chunk would corrupt HTTP.
+        int written = http->Write(data, size);
+        if (written < 0 || static_cast<size_t>(written) < size) {
+            throw std::runtime_error("Image upload was interrupted");
         }
-        if (chunk.data == nullptr) {
-            saw_terminator = true;
-            break;
-        }
-        http->Write((const char *)chunk.data, chunk.len);
-        total_sent += chunk.len;
-        heap_caps_free(chunk.data);
-    }
-    encoder_thread_.join();
-    vQueueDelete(jpeg_queue);
+    };
+    const std::string question_field =
+        "--" + boundary + "\r\n"
+        "Content-Disposition: form-data; name=\"question\"\r\n\r\n" +
+        question + "\r\n";
+    write_chunk(question_field.data(), question_field.size());
+    const std::string file_header =
+        "--" + boundary + "\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"camera.jpg\"\r\n"
+        "Content-Type: image/jpeg\r\n\r\n";
+    write_chunk(file_header.data(), file_header.size());
 
-    if (!saw_terminator || total_sent == 0) {
-        ESP_LOGE(TAG, "JPEG encoder failed or produced empty output");
-        throw std::runtime_error("Failed to encode image to JPEG");
+    // Bound transient copies made by the TCP-backed HTTP implementation.
+    constexpr size_t kUploadChunkSize = 4096;
+    for (size_t offset = 0; offset < jpeg_size;) {
+        size_t size = std::min(kUploadChunkSize, jpeg_size - offset);
+        write_chunk(reinterpret_cast<const char*>(jpeg.get() + offset), size);
+        offset += size;
     }
-
-    {
-        std::string multipart_footer;
-        multipart_footer += "\r\n--" + boundary + "--\r\n";
-        http->Write(multipart_footer.c_str(), multipart_footer.size());
-    }
-    http->Write("", 0);
+    jpeg.reset();
+    const std::string footer = "\r\n--" + boundary + "--\r\n";
+    write_chunk(footer.data(), footer.size());
+    write_chunk("", 0);
 
     if (http->GetStatusCode() != 200) {
-        ESP_LOGE(TAG, "Failed to upload photo, status code: %d", http->GetStatusCode());
         throw std::runtime_error("Failed to upload photo");
     }
 
-    std::string result = http->ReadAll();
-    http->Close();
-
-    size_t remain_stack_size = uxTaskGetStackHighWaterMark(nullptr);
-    ESP_LOGI(TAG, "Explain image size=%dx%d, compressed size=%d, remain stack size=%d, question=%s\n%s",
-             current_fb_->width, current_fb_->height, (int)total_sent, (int)remain_stack_size, question.c_str(), result.c_str());
+    // Recognition replies are text; cap retained data even for an invalid server.
+    constexpr size_t kMaxResponseSize = 64 * 1024;
+    std::string result;
+    char buffer[512];
+    while (true) {
+        int count = http->Read(buffer, sizeof(buffer));
+        if (count < 0) {
+            throw std::runtime_error("Failed to read image explanation");
+        }
+        if (count == 0) break;
+        if (result.size() + static_cast<size_t>(count) > kMaxResponseSize) {
+            throw std::runtime_error("Image explanation is too large");
+        }
+        result.append(buffer, count);
+    }
+    if (result.empty()) {
+        throw std::runtime_error("Image explanation is empty");
+    }
+    ESP_LOGI(TAG, "Explained image: %ux%u, JPEG=%u bytes, response=%u bytes",
+             static_cast<unsigned>(width), static_cast<unsigned>(height),
+             static_cast<unsigned>(jpeg_size), static_cast<unsigned>(result.size()));
     return result;
 }

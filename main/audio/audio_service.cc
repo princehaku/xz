@@ -196,7 +196,10 @@ void AudioService::Stop() {
         AS_EVENT_AUDIO_PROCESSOR_RUNNING);
 
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++decode_generation_;
+    ++encode_generation_;
     audio_encode_queue_.clear();
+    audio_send_queue_.clear();
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
@@ -235,7 +238,10 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     }
 
     /* Update the last input time */
-    last_input_time_ = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        last_input_time_ = std::chrono::steady_clock::now();
+    }
     debug_statistics_.input_count++;
 
 #if CONFIG_USE_AUDIO_DEBUGGER
@@ -328,6 +334,7 @@ void AudioService::AudioOutputTask() {
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
+        playing_ = true;
         audio_queue_cv_.notify_all();
         lock.unlock();
 
@@ -340,13 +347,15 @@ void AudioService::AudioOutputTask() {
         codec_->OutputData(task->pcm);
 
         /* Update the last output time */
+        lock.lock();
         last_output_time_ = std::chrono::steady_clock::now();
+        playing_ = false;
+        audio_queue_cv_.notify_all();
         debug_statistics_.playback_count++;
 
 #if CONFIG_USE_SERVER_AEC
         /* Record the timestamp for server AEC */
         if (task->timestamp > 0) {
-            lock.lock();
             timestamp_queue_.push_back(task->timestamp);
         }
 #endif
@@ -371,6 +380,8 @@ void AudioService::OpusCodecTask() {
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
             auto packet = std::move(audio_decode_queue_.front());
             audio_decode_queue_.pop_front();
+            const auto generation = decode_generation_.load();
+            decoding_ = true;
             audio_queue_cv_.notify_all();
             lock.unlock();
 
@@ -394,7 +405,11 @@ void AudioService::OpusCodecTask() {
                 };
                 esp_audio_dec_info_t dec_info = {};
                 std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
-                auto ret = esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info);
+                // ResetDecoder may have invalidated this frame while the queue lock
+                // was released. Do not let it change the new decoder history.
+                auto ret = generation == decode_generation_.load()
+                    ? esp_opus_dec_decode(opus_decoder_, &raw, &out_frame, &dec_info)
+                    : ESP_AUDIO_ERR_FAIL;
                 decoder_lock.unlock();
                 if (ret == ESP_AUDIO_ERR_OK) {
                     task->pcm.resize(out_frame.decoded_size / sizeof(int16_t));
@@ -409,17 +424,23 @@ void AudioService::OpusCodecTask() {
                         task->pcm = std::move(resampled);
                     }
                     lock.lock();
-                    audio_playback_queue_.push_back(std::move(task));
+                    if (generation == decode_generation_.load() && !service_stopped_) {
+                        audio_playback_queue_.push_back(std::move(task));
+                    }
                     audio_queue_cv_.notify_all();
                     debug_statistics_.decode_count++;
                 } else {
-                    ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
+                    if (generation == decode_generation_.load()) {
+                        ESP_LOGE(TAG, "Failed to decode audio after resize, error code: %d", ret);
+                    }
                     lock.lock();
                 }
             } else {
                 ESP_LOGE(TAG, "Audio decoder is not configured");
                 lock.lock();
             }
+            decoding_ = false;
+            audio_queue_cv_.notify_all();
         }
         /* Encode the audio to send queue */
         if (!audio_encode_queue_.empty()) {
@@ -430,22 +451,23 @@ void AudioService::OpusCodecTask() {
                 audio_queue_cv_.notify_all();
                 /* lock still held – continue to next loop iteration */
             /* Software echo suppression: discard mic audio while TTS is playing or
-             * queued for playback, and for 1000ms after playback stops to cover tailings.
+             * queued for playback, and for 200ms after playback stops to cover tailings.
              * This prevents the speaker output from feeding back into the ASR pipeline
              * when AEC hardware reference is unavailable.
              * When keep_uplink_ is set (server-side barge-in mode), mic audio is forwarded
              * to the server even during playback so the server can perform VAD/ASR and
              * decide whether to interrupt the current TTS. */
             } else if (!keep_uplink_ &&
-                       (!audio_playback_queue_.empty() || !audio_decode_queue_.empty() ||
+                       (playing_ || decoding_ || !audio_playback_queue_.empty() || !audio_decode_queue_.empty() ||
                         std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - last_output_time_).count() < 1000)) {
+                            std::chrono::steady_clock::now() - last_output_time_).count() < 200)) {
                 audio_encode_queue_.pop_front();
                 audio_queue_cv_.notify_all();
                 /* lock still held – continue to next loop iteration */
             } else {
                 auto task = std::move(audio_encode_queue_.front());
                 audio_encode_queue_.pop_front();
+                const auto generation = encode_generation_;
                 audio_queue_cv_.notify_all();
                 lock.unlock();
 
@@ -455,19 +477,19 @@ void AudioService::OpusCodecTask() {
                 packet->timestamp = task->timestamp;
 
                 if (opus_encoder_ != nullptr && task->pcm.size() == encoder_frame_size_) {
-                    std::vector<uint8_t> buf(encoder_outbuf_size_);
+                    packet->payload.resize(encoder_outbuf_size_);
                     esp_audio_enc_in_frame_t in = {
                         .buffer = (uint8_t *)(task->pcm.data()),
                         .len = (uint32_t)(encoder_frame_size_ * sizeof(int16_t)),
                     };
                     esp_audio_enc_out_frame_t out = {
-                        .buffer = buf.data(),
+                        .buffer = packet->payload.data(),
                         .len = (uint32_t)encoder_outbuf_size_,
                         .encoded_bytes = 0,
                     };
                     auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
                     if (ret == ESP_AUDIO_ERR_OK) {
-                        packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
+                        packet->payload.resize(out.encoded_bytes);
                         static uint32_t encode_count = 0;
                         encode_count++;
                         if (encode_count == 1 || encode_count % 50 == 0) {
@@ -478,11 +500,16 @@ void AudioService::OpusCodecTask() {
                         }
 
                         if (task->type == kAudioTaskTypeEncodeToSendQueue) {
+                            bool queued = false;
                             {
                                 std::lock_guard<std::mutex> lock2(audio_queue_mutex_);
-                                audio_send_queue_.push_back(std::move(packet));
+                                if (generation == encode_generation_ && !service_stopped_ &&
+                                    audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+                                    audio_send_queue_.push_back(std::move(packet));
+                                    queued = true;
+                                }
                             }
-                            if (callbacks_.on_send_queue_available) {
+                            if (queued && callbacks_.on_send_queue_available) {
                                 callbacks_.on_send_queue_available();
                             }
                         } else if (task->type == kAudioTaskTypeEncodeToTestingQueue) {
@@ -518,7 +545,6 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
         esp_opus_dec_close(opus_decoder_);
         opus_decoder_ = nullptr;
     }
-    decoder_lock.unlock();
     esp_opus_dec_cfg_t opus_dec_cfg = OPUS_DEC_CFG(sample_rate, 120);
     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
     if (opus_decoder_ == nullptr) {
@@ -551,6 +577,10 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
     task->pcm = std::move(pcm);
     /* Push the task to the encode queue */
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    if (service_stopped_ ||
+        (type == kAudioTaskTypeEncodeToSendQueue && !IsAudioProcessorRunning())) {
+        return;
+    }
 
     /* If the task is to send queue, we need to set the timestamp */
     if (type == kAudioTaskTypeEncodeToSendQueue && !timestamp_queue_.empty()) {
@@ -568,7 +598,12 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
             audio_encode_queue_.pop_front();
             ESP_LOGW(TAG, "Encode queue full, dropping oldest frame");
         } else {
-            audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
+            audio_queue_cv_.wait(lock, [this]() {
+                return service_stopped_ || audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE;
+            });
+            if (service_stopped_) {
+                return;
+            }
         }
     }
     audio_encode_queue_.push_back(std::move(task));
@@ -579,10 +614,18 @@ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> pa
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
         if (wait) {
-            audio_queue_cv_.wait(lock, [this]() { return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE; });
+            if (!audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(120), [this]() {
+                return audio_decode_queue_.size() < MAX_DECODE_PACKETS_IN_QUEUE || service_stopped_;
+            })) {
+                ESP_LOGW(TAG, "Decode queue full, backpressure timeout, dropping packet");
+                return false;
+            }
         } else {
             return false;
         }
+    }
+    if (service_stopped_) {
+        return false;
     }
     audio_decode_queue_.push_back(std::move(packet));
     audio_queue_cv_.notify_all();
@@ -729,18 +772,26 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+    return !decoding_ && !playing_ && audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+}
+
+bool AudioService::IsPlaybackComplete() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return service_stopped_ ||
+        (!decoding_ && !playing_ && audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
+         std::chrono::steady_clock::now() - last_output_time_ >= std::chrono::milliseconds(200));
 }
 
 void AudioService::WaitForPlaybackQueueEmpty() {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
     audio_queue_cv_.wait(lock, [this]() { 
-        return service_stopped_ || (audio_decode_queue_.empty() && audio_playback_queue_.empty()); 
+        return service_stopped_ || (!decoding_ && !playing_ && audio_decode_queue_.empty() && audio_playback_queue_.empty());
     });
 }
 
 void AudioService::ResetDecoder() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++decode_generation_;
     std::unique_lock<std::mutex> decoder_lock(decoder_mutex_);
     if (opus_decoder_ != nullptr) {
         esp_opus_dec_reset(opus_decoder_);
@@ -753,10 +804,23 @@ void AudioService::ResetDecoder() {
     audio_queue_cv_.notify_all();
 }
 
+void AudioService::ResetEncoder() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    ++encode_generation_;
+    audio_encode_queue_.clear();
+    audio_send_queue_.clear();
+    audio_queue_cv_.notify_all();
+}
+
 void AudioService::CheckAndUpdateAudioPowerState() {
     auto now = std::chrono::steady_clock::now();
-    auto input_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
-    auto output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
+    int64_t input_elapsed;
+    int64_t output_elapsed;
+    {
+        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+        input_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_input_time_).count();
+        output_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_output_time_).count();
+    }
     if (input_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->input_enabled()) {
         codec_->EnableInput(false);
     }

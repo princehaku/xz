@@ -2,6 +2,7 @@
 #define AUDIO_SERVICE_H
 
 #include <memory>
+#include <atomic>
 #include <deque>
 #include <condition_variable>
 #include <chrono>
@@ -40,8 +41,8 @@
 #define MAX_ENCODE_TASKS_IN_QUEUE 8
 /* PCM frames waiting for I2S; too few causes I2S underrun (crackles) when Opus decode hiccups. */
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 8
-#define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
-#define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
+#define MAX_DECODE_PACKETS_IN_QUEUE (600 / OPUS_FRAME_DURATION_MS)
+#define MAX_SEND_PACKETS_IN_QUEUE (600 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
 #define MAX_TIMESTAMPS_IN_QUEUE 3
 
@@ -93,7 +94,7 @@ enum AudioTaskType {
 struct AudioTask {
     AudioTaskType type;
     std::vector<int16_t> pcm;
-    uint32_t timestamp;
+    uint32_t timestamp = 0;
 };
 
 struct DebugStatistics {
@@ -116,6 +117,7 @@ public:
     const std::string& GetLastWakeWord() const;
     bool IsVoiceDetected() const { return voice_detected_; }
     bool IsIdle();
+    bool IsPlaybackComplete();
     void WaitForPlaybackQueueEmpty();
     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
@@ -125,7 +127,7 @@ public:
     void EnableVoiceProcessing(bool enable);
     void EnableAudioTesting(bool enable);
     void EnableDeviceAec(bool enable);
-    void SetKeepUplink(bool enable) { keep_uplink_ = enable; }
+    void SetKeepUplink(bool enable) { keep_uplink_.store(enable); }
 
     void SetCallbacks(AudioServiceCallbacks& callbacks);
 
@@ -134,6 +136,7 @@ public:
     void PlaySound(const std::string_view& sound);
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
+    void ResetEncoder();
     void SetModelsList(srmodel_list_t* models_list);
 
 private:
@@ -173,15 +176,19 @@ private:
     std::deque<std::unique_ptr<AudioStreamPacket>> audio_testing_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_encode_queue_;
     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
+    std::atomic<uint32_t> decode_generation_{0};
+    uint32_t encode_generation_ = 0;
+    bool decoding_ = false;
+    bool playing_ = false;
     // For server AEC
     std::deque<uint32_t> timestamp_queue_;
 
     bool wake_word_initialized_ = false;
     bool audio_processor_initialized_ = false;
-    bool voice_detected_ = false;
-    bool service_stopped_ = true;
-    bool audio_input_need_warmup_ = false;
-    bool keep_uplink_ = false;
+    std::atomic<bool> voice_detected_{false};
+    std::atomic<bool> service_stopped_{true};
+    std::atomic<bool> audio_input_need_warmup_{false};
+    std::atomic<bool> keep_uplink_{false};
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
