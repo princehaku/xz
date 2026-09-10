@@ -119,6 +119,8 @@ public:
     AudioService& GetAudioService() { return audio_service_; }
     Protocol* GetProtocol() { return protocol_.get(); }
     void NotifySTT(const std::string& text);
+    // Completes on the main task after this connection receives fresh vision capabilities.
+    void PrepareCameraSession(std::function<void(bool)> callback);
     void SetKeepAlive(bool enable);
     void EndConversation();
 
@@ -149,6 +151,17 @@ private:
     int64_t audio_channel_opened_ms_ = 0;
     std::atomic<uint32_t> audio_channel_generation_{0};
     std::atomic<uint32_t> conversation_generation_{0};
+    std::atomic<uint32_t> camera_request_generation_{0};
+    std::atomic<bool> camera_session_active_{false};
+    std::atomic<bool> camera_result_pending_{false};
+    std::function<void(bool)> camera_prepare_callback_;
+    uint32_t camera_prepare_generation_ = 0;
+    uint32_t camera_channel_generation_ = 0;
+    uint32_t camera_vision_baseline_ = 0;
+    int64_t camera_prepare_deadline_ms_ = 0;
+    int64_t camera_ready_ms_ = 0;
+    bool camera_open_started_ = false;
+    bool camera_session_ready_ = false;
     uint32_t tts_generation_ = 0;
     uint32_t pending_tts_generation_ = 0;
     bool tts_completion_pending_ = false;
@@ -184,6 +197,9 @@ private:
     void HandleReconnect();
     void CancelTtsCompletion();
     void HandlePlaybackProgress();
+    void HandleCameraPreparation();
+    void CompleteCameraPreparation(bool ready);
+    void CancelCameraSession();
 
     // Activation task (runs in background)
     void ActivationTask();

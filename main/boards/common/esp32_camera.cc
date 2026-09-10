@@ -358,8 +358,11 @@ std::string Esp32Camera::Explain(const std::string &question) {
     write_chunk(footer.data(), footer.size());
     write_chunk("", 0);
 
-    if (http->GetStatusCode() != 200) {
-        throw std::runtime_error("Failed to upload photo");
+    const int status = http->GetStatusCode();
+    if (status != 200) {
+        // Do not expose URLs, credentials or response bodies in diagnostics.
+        ESP_LOGE(TAG, "Image upload HTTP status: %d", status);
+        throw std::runtime_error("Failed to upload photo (HTTP " + std::to_string(status) + ")");
     }
 
     // Recognition replies are text; cap retained data even for an invalid server.

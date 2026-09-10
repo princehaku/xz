@@ -38,6 +38,7 @@ HARNESS = r'''
 #include <string>
 #include <vector>
 #define ESP_LOGI(...) ((void)0)
+#define ESP_LOGE(...) ((void)0)
 enum {
     PIXFORMAT_RGB565, PIXFORMAT_YUV422, PIXFORMAT_YUV420,
     PIXFORMAT_GRAYSCALE, PIXFORMAT_JPEG, PIXFORMAT_RGB888,
@@ -57,6 +58,7 @@ struct camera_fb_t {
 enum class Failure { none, encode, empty_jpeg, create_http, open,
     short_write, write, terminator, status, read, empty_reply, huge_reply };
 Failure failure;
+int response_status = 503;
 int returned_frames, closed_http, opened_http;
 size_t encoded_source_size, max_write_size, response_offset;
 std::string uploaded;
@@ -89,7 +91,7 @@ public:
         // The TCP implementation reports chunk framing in its byte count.
         return len + 8;
     }
-    int GetStatusCode() { return failure == Failure::status ? 503 : 200; }
+    int GetStatusCode() { return failure == Failure::status ? response_status : 200; }
     int Read(char* data, size_t cap) {
         if (failure == Failure::read) return -1;
         std::string response = failure == Failure::huge_reply ?
@@ -151,7 +153,12 @@ int main() {
         bool threw = false;
         try {
             assert(camera.Explain("what is this?") == "a dog");
-        } catch (const std::runtime_error&) { threw = true; }
+        } catch (const std::runtime_error& error) {
+            threw = true;
+            if (fault == Failure::status) {
+                assert(std::string(error.what()) == "Failed to upload photo (HTTP 503)");
+            }
+        }
         assert(threw == (fault != Failure::none));
         assert(camera.current_fb_ == nullptr && returned_frames == 1);
         camera.ReleaseFrame();
@@ -180,6 +187,22 @@ int main() {
         catch (const std::runtime_error&) { threw = true; }
         assert(threw && opened_http == 0 && closed_http == 0);
         assert(returned_frames == (invalid == 0 ? 0 : 1));
+        ++cases;
+    }
+    for (int status : {-1, 401, 403, 429}) {
+        reset(Failure::status);
+        response_status = status;
+        Esp32Camera camera;
+        camera.explain_token_ = "test-secret-value";
+        camera_fb_t frame;
+        camera.current_fb_ = &frame;
+        bool threw = false;
+        try { camera.Explain("test"); }
+        catch (const std::runtime_error& error) {
+            threw = true;
+            assert(std::string(error.what()) == "Failed to upload photo (HTTP " + std::to_string(status) + ")");
+        }
+        assert(threw && closed_http == 1 && returned_frames == 1);
         ++cases;
     }
     std::cout << "Camera upload regression: " << cases << " cases passed\n";

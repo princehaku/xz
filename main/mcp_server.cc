@@ -376,6 +376,9 @@ void McpServer::ParseCapabilities(const cJSON* capabilities) {
                     token_str.assign(token_value);
                 }
                 camera->SetExplainUrl(url_str, token_str);
+                // Only a live MCP initialize advances readiness; restored NVS values do not.
+                ++vision_capability_revision_;
+                ESP_LOGI(TAG, "Vision capabilities refreshed");
                 Settings camera_settings("camera", true);
                 camera_settings.SetString("explain_url", url_str);
                 camera_settings.SetString("explain_token", token_str);

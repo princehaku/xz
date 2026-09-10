@@ -295,6 +295,7 @@ public:
     std::atomic<AppMode> app_mode_{AppMode::kHome};
     SpiLcdDisplay* display_ = nullptr;
     lv_obj_t *photo_hint_ = nullptr, *preview_canvas_ = nullptr, *home_overlay_ = nullptr;
+    lv_obj_t *home_chat_button_ = nullptr, *home_camera_button_ = nullptr, *home_status_label_ = nullptr;
     std::shared_ptr<LvglFont> photo_font_;
     std::unique_ptr<int> music_screen_;
     std::string photo_hint_text_, photo_hint_fallback_;

@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <esp_heap_caps.h>
@@ -126,7 +127,12 @@ private:
     enum class AppMode { kHome, kAiGuide, kAiPhoto, kMusic };
     std::atomic<AppMode> app_mode_{AppMode::kHome};
     std::atomic<uint32_t> page_generation_{0};
+    std::atomic<bool> wifi_ready_{false};
     lv_obj_t* home_overlay_ = nullptr;
+    lv_obj_t* home_chat_button_ = nullptr;
+    lv_obj_t* home_camera_button_ = nullptr;
+    lv_obj_t* home_status_label_ = nullptr;
+    lv_timer_t* home_status_timer_ = nullptr;
     lv_obj_t* preview_canvas_ = nullptr;
     lv_obj_t* photo_hint_ = nullptr;
     std::shared_ptr<LvglFont> photo_font_;
@@ -182,8 +188,34 @@ private:
     }
 
     // ──────────────────── Home screen LVGL callbacks ────────────────────
+    bool IsAiReady() const {
+        return wifi_ready_ && Application::GetInstance().GetDeviceState() == kDeviceStateIdle;
+    }
+
+    // Runs under the LVGL lock. Keep offline music available during startup.
+    void RefreshHomeReadinessLocked() {
+        if (!home_status_label_ || !home_chat_button_ || !home_camera_button_) return;
+        const bool ready = IsAiReady();
+        for (auto* button : {home_chat_button_, home_camera_button_}) {
+            if (ready) lv_obj_remove_state(button, LV_STATE_DISABLED);
+            else lv_obj_add_state(button, LV_STATE_DISABLED);
+        }
+        if (ready) {
+            lv_obj_add_flag(home_status_label_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        lv_obj_remove_flag(home_status_label_, LV_OBJ_FLAG_HIDDEN);
+        const auto state = Application::GetInstance().GetDeviceState();
+        const char* message = !wifi_ready_ ? "Connecting Wi-Fi..." :
+            state == kDeviceStateActivating ? "Preparing AI..." : "Starting...";
+        if (strcmp(lv_label_get_text(home_status_label_), message) != 0) {
+            lv_label_set_text(home_status_label_, message);
+        }
+    }
+
     static void HomeScreenGuideClicked(lv_event_t* e) {
         auto* self = static_cast<LichuangDevBoardML307*>(lv_event_get_user_data(e));
+        if (!self->IsAiReady()) return;
         ESP_LOGI(TAG, "[home] Entering CALL mode, ToggleChatState");
         self->StopPreview();
         self->DeleteOverlayLocked();
@@ -205,6 +237,7 @@ private:
 
     static void HomeScreenPhotoClicked(lv_event_t* e) {
         auto* self = static_cast<LichuangDevBoardML307*>(lv_event_get_user_data(e));
+        if (!self->IsAiReady()) return;
         ESP_LOGI(TAG, "[home] Entering AI Photo mode");
         self->StopPreview();
         self->DeleteOverlayLocked();
@@ -302,6 +335,9 @@ private:
 
     // Call only while holding the LVGL lock (including LVGL event callbacks).
     void DeleteOverlayLocked() {
+        home_chat_button_ = nullptr;
+        home_camera_button_ = nullptr;
+        home_status_label_ = nullptr;
         preview_canvas_ = nullptr;
         photo_hint_ = nullptr;
         // Retain the screen/font until LVGL has destroyed all of its labels.
@@ -559,11 +595,13 @@ private:
 
         // ── Left zone: CALL (phone mode, dark blue) ──
         lv_obj_t* left = lv_obj_create(home_overlay_);
+        home_chat_button_ = left;
         lv_obj_remove_style_all(left);
         lv_obj_set_size(left, MID - 1, top_height);
         lv_obj_set_pos(left, 0, 0);
         lv_obj_set_style_bg_color(left, lv_color_hex(0x1A237E), 0);
         lv_obj_set_style_bg_opa(left, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(left, lv_color_hex(0x242634), LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(left, lv_color_hex(0x3949AB), LV_STATE_PRESSED);
         lv_obj_add_flag(left, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(left, LV_OBJ_FLAG_SCROLLABLE);
@@ -595,11 +633,13 @@ private:
 
         // ── Right zone: 百科相机 (static, like left side) ──
         lv_obj_t* right = lv_obj_create(home_overlay_);
+        home_camera_button_ = right;
         lv_obj_remove_style_all(right);
         lv_obj_set_size(right, W - MID - 1, top_height);
         lv_obj_set_pos(right, MID + 1, 0);
         lv_obj_set_style_bg_color(right, lv_color_hex(0x004D40), 0);
         lv_obj_set_style_bg_opa(right, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(right, lv_color_hex(0x242634), LV_STATE_DISABLED);
         lv_obj_set_style_bg_color(right, lv_color_hex(0x00695C), LV_STATE_PRESSED);
         lv_obj_add_flag(right, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(right, LV_OBJ_FLAG_SCROLLABLE);
@@ -635,6 +675,19 @@ private:
         lv_label_set_text(music_title, "SD Music");
         lv_obj_center(music_title);
 
+        home_status_label_ = lv_label_create(home_overlay_);
+        lv_obj_set_size(home_status_label_, W, LV_SIZE_CONTENT);
+        lv_obj_set_pos(home_status_label_, 0, 10);
+        lv_obj_set_style_text_font(home_status_label_, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(home_status_label_, lv_color_hex(0xDDDDDD), 0);
+        lv_obj_set_style_text_align(home_status_label_, LV_TEXT_ALIGN_CENTER, 0);
+        if (!home_status_timer_) {
+            home_status_timer_ = lv_timer_create([](lv_timer_t* timer) {
+                static_cast<LichuangDevBoardML307*>(lv_timer_get_user_data(timer))->RefreshHomeReadinessLocked();
+            }, 250, this);
+        }
+        RefreshHomeReadinessLocked();
+
         lvgl_port_unlock();
         ESP_LOGI(TAG, "Home screen shown");
     }
@@ -659,13 +712,18 @@ private:
                 if (app_mode_ == AppMode::kAiPhoto) StartPreview();
                 return;
             }
-            auto& app = Application::GetInstance();
-            app.EndConversation();
-            // Queue the worker request after the main-task conversation cleanup.
-            app.Schedule([this, generation]() {
+            SetPhotoHint("正在连接识图服务 / 双击返回", "Connecting vision... / Double-click to exit");
+            Application::GetInstance().PrepareCameraSession([this, generation](bool ready) {
                 if (generation != page_generation_ || app_mode_ != AppMode::kAiPhoto) {
                     photo_task_running_ = false;
                     if (app_mode_ == AppMode::kAiPhoto) StartPreview();
+                    return;
+                }
+                if (!ready) {
+                    photo_task_running_ = false;
+                    StartPreview();
+                    SetPhotoHint("识图服务未就绪，按键重试 / 双击返回",
+                        "Vision unavailable. Press to retry / Double-click to exit");
                     return;
                 }
                 SetPhotoHint("拍照识图中 / 双击返回", "Recognizing... / Double-click to exit");
@@ -710,6 +768,7 @@ private:
                 return;
             }
             if (!error.empty()) {
+                Application::GetInstance().EndConversation();
                 StartPreview();
                 SetPhotoHint(error.c_str(), "Capture failed. Press to retry / Double-click to exit");
                 return;
@@ -984,6 +1043,10 @@ public:
         WifiBoard::SetNetworkEventCallback(
             [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
                 auto& app = Application::GetInstance();
+                if (event == NetworkEvent::Connected) wifi_ready_ = true;
+                else if (event == NetworkEvent::Disconnected || event == NetworkEvent::WifiConfigModeEnter) {
+                    wifi_ready_ = false;
+                }
                 if (event == NetworkEvent::WifiConfigModeEnter && app_mode_ != AppMode::kMusic) {
                     StopPreview();
                     if (music_player_) music_player_->Stop();

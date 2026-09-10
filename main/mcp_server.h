@@ -9,6 +9,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <atomic>
 #include <mbedtls/base64.h>
 
 #include <cJSON.h>
@@ -325,6 +326,7 @@ public:
     void AddUserOnlyTool(const std::string& name, const std::string& description, const PropertyList& properties, std::function<ReturnValue(const PropertyList&)> callback);
     void ParseMessage(const cJSON* json);
     void ParseMessage(const std::string& message);
+    uint32_t VisionCapabilityRevision() const { return vision_capability_revision_.load(); }
 
 private:
     McpServer();
@@ -339,6 +341,7 @@ private:
     void DoToolCall(int id, const std::string& tool_name, const cJSON* tool_arguments);
 
     std::vector<McpTool*> tools_;
+    std::atomic<uint32_t> vision_capability_revision_{0};
 };
 
 #endif // MCP_SERVER_H

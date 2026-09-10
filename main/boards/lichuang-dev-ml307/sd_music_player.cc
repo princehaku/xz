@@ -303,7 +303,8 @@ bool SdMusicPlayer::MountAndScan(uint32_t generation) {
     Unmount();
     if (!IsCurrent(generation)) return false;
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.flags = SDMMC_HOST_FLAG_1BIT;
+    // Keep lifecycle flags: IDF's default deinit callback requires the slot argument.
+    host.flags &= ~(SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_8BIT | SDMMC_HOST_FLAG_DDR);
     host.max_freq_khz = SDMMC_FREQ_DEFAULT;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 1;

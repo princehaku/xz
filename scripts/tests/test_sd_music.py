@@ -4,6 +4,8 @@
 Run in Linux/WSL with Python 3 and g++. Does not invoke ESP-IDF or touch an SD card.
 The parser/decoder/resampler hardware boundary is simulated; control, scanning,
 WAV validation, streaming, cancellation and PCM chunking use production code.
+The SD host stub models IDF's default flags and slot-aware cleanup on mount
+failure/unmount; it does not simulate card electrical behavior.
 """
 
 from pathlib import Path
@@ -170,13 +172,40 @@ struct Board {
     static Board& GetInstance() { static Board board; return board; }
     Codec* GetAudioCodec() { static Codec codec; return &codec; }
 };
-struct sdmmc_card_t {};
-struct sdmmc_host_t { int flags = 0, max_freq_khz = 0; };
+#define SDMMC_HOST_FLAG_1BIT (1 << 0)
+#define SDMMC_HOST_FLAG_4BIT (1 << 1)
+#define SDMMC_HOST_FLAG_8BIT (1 << 2)
+#define SDMMC_HOST_FLAG_DDR (1 << 4)
+#define SDMMC_HOST_FLAG_DEINIT_ARG (1 << 5)
+static std::atomic<bool> host_initialized{false};
+static std::atomic<int> host_inits, host_deinits, wrong_host_deinits, duplicate_host_inits;
+int sdmmc_host_init() {
+    if (host_initialized.exchange(true)) { ++duplicate_host_inits; return -2; }
+    ++host_inits;
+    return 0;
+}
+int sdmmc_host_deinit_slot(int slot) {
+    assert(slot == 1 && host_initialized);
+    ++host_deinits;
+    host_initialized = false;
+    return 0;
+}
+// Keep the wrong callback deterministic: invoking IDF's union member without its
+// slot argument has undefined behavior and may leave the real host initialized.
+int sdmmc_host_deinit_without_slot() { ++wrong_host_deinits; return -2; }
+struct sdmmc_host_t {
+    int flags = SDMMC_HOST_FLAG_1BIT | SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_8BIT |
+                SDMMC_HOST_FLAG_DDR | SDMMC_HOST_FLAG_DEINIT_ARG;
+    int max_freq_khz = 0, slot = 1;
+    int (*init)() = sdmmc_host_init;
+    int (*deinit)() = sdmmc_host_deinit_without_slot;
+    int (*deinit_p)(int) = sdmmc_host_deinit_slot;
+};
+struct sdmmc_card_t { sdmmc_host_t host; };
 struct sdmmc_slot_config_t { int width = 0, clk = 0, cmd = 0, d0 = 0, flags = 0; };
 struct esp_vfs_fat_sdmmc_mount_config_t { bool format_if_mount_failed; int max_files; size_t allocation_unit_size; };
 #define SDMMC_HOST_DEFAULT() sdmmc_host_t{}
 #define SDMMC_SLOT_CONFIG_DEFAULT() sdmmc_slot_config_t{}
-#define SDMMC_HOST_FLAG_1BIT 1
 #define SDMMC_FREQ_DEFAULT 20000
 #define SDMMC_SLOT_FLAG_INTERNAL_PULLUP 1
 #define SD_MMC_CLK_GPIO 47
@@ -186,18 +215,30 @@ struct esp_vfs_fat_sdmmc_mount_config_t { bool format_if_mount_failed; int max_f
 static std::atomic<bool> card_available{true};
 static std::atomic<int> mounts, unmounts;
 static std::function<void()> mount_hook;
+// Mirror IDF fatfs/vfs/vfs_fat_sdmmc.c's call_host_deinit dispatch. Both failed
+// mounts and successful-card unmounts must release the initialized host slot.
+void call_host_deinit(const sdmmc_host_t* host) {
+    if (host->flags & SDMMC_HOST_FLAG_DEINIT_ARG) host->deinit_p(host->slot);
+    else host->deinit();
+}
 int esp_vfs_fat_sdmmc_mount(const char*, sdmmc_host_t* host, sdmmc_slot_config_t* slot,
         esp_vfs_fat_sdmmc_mount_config_t* config, sdmmc_card_t** card) {
     assert(!config->format_if_mount_failed);
-    assert(host->flags == SDMMC_HOST_FLAG_1BIT && slot->width == 1);
+    assert((host->flags & SDMMC_HOST_FLAG_1BIT) && slot->width == 1);
+    assert(!(host->flags & (SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_8BIT | SDMMC_HOST_FLAG_DDR)));
     assert(slot->clk == 47 && slot->cmd == 48 && slot->d0 == 21);
     ++mounts;
+    if (const int error = host->init()) return error;
     if (mount_hook) mount_hook();
-    if (!card_available) return -1;
-    *card = new sdmmc_card_t;
+    if (!card_available) { call_host_deinit(host); return -1; }
+    *card = new sdmmc_card_t{*host};
     return 0;
 }
-void esp_vfs_fat_sdcard_unmount(const char*, sdmmc_card_t* card) { ++unmounts; delete card; }
+void esp_vfs_fat_sdcard_unmount(const char*, sdmmc_card_t* card) {
+    ++unmounts;
+    call_host_deinit(&card->host);
+    delete card;
+}
 static fs::path card_root;
 std::string actual_path(const char* path) {
     std::string text(path);
@@ -343,20 +384,35 @@ int main(int argc, char** argv) {
         card_available = false; player.Start();
         wait_until([&] { return player.GetSnapshot().state == SdMusicPlayer::State::kNoCard; });
         assert(audio.IsLocalPlaybackActive());
+        assert(!host_initialized && host_inits == host_deinits && wrong_host_deinits == 0);
         const int tried = mounts;
         std::this_thread::sleep_for(20ms); assert(mounts == tried);
-        card_available = true; player.Rescan();
+        for (int retry = 0; retry < 2; ++retry) {
+            const int released = host_deinits;
+            player.Rescan();
+            wait_until([&] { return player.GetSnapshot().state == SdMusicPlayer::State::kNoCard; });
+            assert(mounts == tried + retry + 1 && host_deinits == released + 1);
+            assert(!host_initialized && duplicate_host_inits == 0 && wrong_host_deinits == 0);
+        }
+        player.Stop();
+        assert(!audio.IsLocalPlaybackActive() && !host_initialized);
+        card_available = true; player.Start();
         wait_until([&] { return player.GetSnapshot().state == SdMusicPlayer::State::kEmpty; });
+        assert(host_initialized);
         write_file(card_root / "bad-a.mp3", "X"); write_file(card_root / "bad-b.mp3", "X");
         const int opened = decoder_opens;
+        const int released = host_deinits;
         player.Rescan();
         wait_until([&] { return player.GetSnapshot().state == SdMusicPlayer::State::kError; });
         assert(decoder_opens - opened == 2); // One bounded pass through an all-bad playlist.
+        assert(host_deinits == released + 1 && host_initialized && duplicate_host_inits == 0);
         player.Stop(); assert(!audio.IsLocalPlaybackActive());
         assert(player.GetSnapshot().state == SdMusicPlayer::State::kStopped);
+        wait_until([&] { return !host_initialized; });
     }
-    assert(decoder_opens == decoder_closes);
-    std::cout << "PASS: async no-card/empty/rescan/all-bad lifecycle and immediate stop\n";
+    assert(decoder_opens == decoder_closes && host_inits == host_deinits);
+    assert(wrong_host_deinits == 0 && duplicate_host_inits == 0);
+    std::cout << "PASS: failed-mount retries, restart, mounted rescan and exit release the host slot\n";
 
     card_root = fixture / "paused";
     write_file(card_root / "a.mp3", "G" + std::string(300000, 'x'));
@@ -391,8 +447,9 @@ int main(int argc, char** argv) {
     }
     std::cout << "PASS: pause retains decoder/PCM position, resume retries, next/previous cancel old tracks\n";
 
-    {
+    for (bool available : {false, true}) {
         std::atomic<bool> entered = false, release = false;
+        card_available = available;
         mount_hook = [&] { entered = true; while (!release) std::this_thread::sleep_for(1ms); };
         AudioService audio;
         SdMusicPlayer player(audio);
@@ -403,12 +460,13 @@ int main(int argc, char** argv) {
         const auto replacement = audio.BeginLocalPlayback();
         release = true;
         wait_until([&] { std::lock_guard lock(player.mutex_); return player.snapshot_.state == SdMusicPlayer::State::kStopped; });
-        std::this_thread::sleep_for(20ms);
+        wait_until([&] { return !host_initialized; });
         assert(audio.active == replacement);
     }
     mount_hook = {};
     assert(decoder_opens == decoder_closes);
-    std::cout << "PASS: blocked SD mount does not block Stop or invalidate a new audio session\n";
+    assert(host_inits == host_deinits && wrong_host_deinits == 0 && duplicate_host_inits == 0);
+    std::cout << "PASS: Stop during failed/successful mount cleans the host and preserves newer audio\n";
 }
 '''
 

@@ -3,7 +3,8 @@
 
 Requires Python 3, gcc/g++ (WSL on Windows). The temporary host build exercises
 layout, button actions, player-state updates, glyph fallback, font ownership,
-and timer teardown. It never configures firmware or accesses the SD card.
+timer teardown, home readiness, and camera session gating. It never configures
+firmware or accesses the SD card/camera/network hardware.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +32,7 @@ HARNESS = r'''
 #include <atomic>
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <iostream>
 #include <utility>
@@ -118,16 +120,24 @@ static int lock_depth = 0;
 static bool lvgl_port_lock(uint32_t) { ++lock_depth; return true; }
 static void lvgl_port_unlock() { assert(lock_depth > 0); --lock_depth; }
 static void heap_caps_free(void* p) { free(p); }
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGW(...) ((void)0)
+#define FONT_AWESOME_PHONE "P"
+#define FONT_AWESOME_CAMERA "C"
+static int photo_notifications = 0;
+static void xTaskNotifyGive(void*) { ++photo_notifications; }
 enum DeviceState { kDeviceStateIdle, kDeviceStateConnecting, kDeviceStateListening,
-                   kDeviceStateSpeaking, kDeviceStateWifiConfiguring };
+                   kDeviceStateSpeaking, kDeviceStateWifiConfiguring,
+                   kDeviceStateStarting, kDeviceStateActivating };
 struct AudioService {
     bool wake = false;
     void EnableWakeWordDetection(bool value) { wake = value; }
 };
 struct Application {
     std::deque<std::function<void()>> queue;
+    std::deque<std::function<void(bool)>> camera_callbacks;
     AudioService audio;
-    int cleanups = 0;
+    int cleanups = 0, wake_calls = 0;
     DeviceState state = kDeviceStateIdle;
     bool keep_alive = false;
     static Application& GetInstance() { static Application value; return value; }
@@ -135,6 +145,16 @@ struct Application {
     void EndConversation() { Schedule([this] { ++cleanups; }); }
     DeviceState GetDeviceState() const { return state; }
     void SetKeepAlive(bool value) { keep_alive = value; }
+    void WakeWordInvoke(const char*) { ++wake_calls; }
+    void PrepareCameraSession(std::function<void(bool)> callback) {
+        camera_callbacks.push_back(std::move(callback));
+    }
+    void CompleteCameraSession(bool ready) {
+        assert(!camera_callbacks.empty());
+        auto callback = std::move(camera_callbacks.front());
+        camera_callbacks.pop_front();
+        callback(ready);
+    }
     AudioService& GetAudioService() { return audio; }
     void Drain() { while (!queue.empty()) { auto fn = std::move(queue.front()); queue.pop_front(); fn(); } }
 };
@@ -150,7 +170,7 @@ struct AudioCodec {
     int output_volume() const { return volume; }
     void SetOutputVolume(int value) { volume = value; }
 };
-enum class NetworkEvent { WifiConfigModeEnter, Connected };
+enum class NetworkEvent { WifiConfigModeEnter, Connected, Disconnected };
 using NetworkEventCallback = std::function<void(NetworkEvent, const std::string&)>;
 struct WifiBoard {
     NetworkEventCallback network_callback;
@@ -168,9 +188,16 @@ public:
     enum class AppMode { kHome, kAiGuide, kAiPhoto, kMusic };
     std::atomic<AppMode> app_mode_{AppMode::kHome};
     std::atomic<uint32_t> page_generation_{0};
+    std::atomic<bool> wifi_ready_{false};
     std::unique_ptr<SdMusicPlayer> music_player_ = std::make_unique<SdMusicPlayer>();
     std::unique_ptr<SdMusicScreen> music_screen_;
     lv_obj_t *home_overlay_ = nullptr, *preview_canvas_ = nullptr, *photo_hint_ = nullptr;
+    lv_obj_t *home_chat_button_ = nullptr, *home_camera_button_ = nullptr, *home_status_label_ = nullptr;
+    lv_timer_t* home_status_timer_ = nullptr;
+    std::atomic<bool> photo_task_running_{false}, photo_requested_{false};
+    std::atomic<uint32_t> photo_generation_{0};
+    void* camera_task_ = this;
+    void* camera_ = this;
     std::shared_ptr<LvglFont> photo_font_;
     std::string photo_hint_text_, photo_hint_fallback_;
     uint8_t* preview_image_buf_ = nullptr;
@@ -179,15 +206,131 @@ public:
     Display display;
     Display* display_ = &display;
     AudioCodec codec;
-    int homes = 0;
+    int homes = 0, preview_starts = 0, preview_stops = 0, photo_views = 0;
+    std::string hint;
     AudioCodec* GetAudioCodec() { return &codec; }
-    void StopPreview() {}
-    void ShowHomeScreen() { ++homes; }
+    void StopPreview() { ++preview_stops; }
+    void StartPreview() { ++preview_starts; }
+    void ShowPhotoPreview() { ++photo_views; }
+    void SetPhotoHint(const char*, const char* fallback) { hint = fallback; }
+    const lv_font_t* IconFont() { return &lv_font_montserrat_14; }
+    void ShowHomeScreen() { ++homes; RenderHomeScreen(); }
     void ShowMusicScreenLocked() { home_overlay_ = lv_obj_create(lv_layer_top()); }
 '''
 
 
 TESTS = r'''
+void TestHomeAndCamera() {
+    auto& app = Application::GetInstance();
+    assert(app.queue.empty() && app.camera_callbacks.empty());
+    const auto initial_timers = TimerCount();
+    app.state = kDeviceStateStarting;
+    LichuangDevBoardML307 board;
+    board.SetNetworkEventCallback({});
+    board.ShowHomeScreen();
+    Tick();
+    auto assert_home = [&](bool ready, const char* status) {
+        assert(board.IsAiReady() == ready);
+        for (auto* button : {board.home_chat_button_, board.home_camera_button_}) {
+            assert(button && lv_obj_has_state(button, LV_STATE_DISABLED) == !ready);
+            const auto color = lv_color_to_u32(lv_obj_get_style_bg_color(button, LV_PART_MAIN));
+            assert((color == lv_color_to_u32(lv_color_hex(0x242634))) == !ready);
+        }
+        assert(lv_obj_has_flag(board.home_status_label_, LV_OBJ_FLAG_HIDDEN) == ready);
+        if (!ready) assert(std::string(lv_label_get_text(board.home_status_label_)) == status);
+        auto* music = Find(board.home_overlay_, "SD Music");
+        assert(music && !lv_obj_has_state(lv_obj_get_parent(music), LV_STATE_DISABLED));
+    };
+    auto force_ai_clicks = [&] {
+        const auto generation = board.page_generation_.load();
+        // Bypass normal LVGL disabled-input filtering to exercise both guards.
+        lv_obj_send_event(board.home_chat_button_, LV_EVENT_CLICKED, nullptr);
+        lv_obj_send_event(board.home_camera_button_, LV_EVENT_CLICKED, nullptr);
+        assert(board.app_mode_ == LichuangDevBoardML307::AppMode::kHome);
+        assert(board.page_generation_ == generation && app.queue.empty());
+    };
+    assert_home(false, "Connecting Wi-Fi..."); force_ai_clicks();
+    const int cleanups = app.cleanups;
+    Click(board.home_overlay_, "SD Music"); app.Drain();
+    assert(board.app_mode_ == LichuangDevBoardML307::AppMode::kMusic);
+    assert(board.music_player_->starts == 1 && app.cleanups == cleanups);
+    assert(!board.home_status_label_ && !board.home_chat_button_ && !board.home_camera_button_);
+    Tick(); Tick(); // The persistent home timer must not touch deleted labels.
+    board.ReturnHome(); app.Drain(); Tick();
+    assert_home(false, "Connecting Wi-Fi...");
+    board.network_callback(NetworkEvent::Connected, ""); app.Drain(); Tick();
+    assert_home(false, "Starting..."); force_ai_clicks();
+    app.state = kDeviceStateActivating; Tick();
+    assert_home(false, "Preparing AI..."); force_ai_clicks();
+    app.state = kDeviceStateIdle; Tick();
+    assert_home(true, "");
+    board.network_callback(NetworkEvent::Disconnected, ""); Tick();
+    assert_home(false, "Connecting Wi-Fi..."); force_ai_clicks();
+    board.network_callback(NetworkEvent::Connected, ""); app.Drain(); Tick();
+    assert_home(true, "");
+    assert(TimerCount() == initial_timers + 1); // Re-created pages share one timer.
+    std::cout << "PASS: real home startup/activation/idle/disconnect states, guarded AI and offline music\n";
+
+    Click(board.home_overlay_, "AI Camera"); app.Drain();
+    assert(board.photo_views == 1 && board.app_mode_ == LichuangDevBoardML307::AppMode::kAiPhoto);
+    assert(!board.home_status_label_ && !board.home_chat_button_ && !board.home_camera_button_);
+    Tick(); Tick();
+    const int notified = photo_notifications;
+    board.CaptureAndExplainPhoto();
+    assert(board.photo_task_running_ && !board.photo_requested_ && app.camera_callbacks.empty());
+    assert(app.queue.size() == 1 && photo_notifications == notified);
+    board.CaptureAndExplainPhoto(); // Repeated BOOT while connecting is coalesced.
+    assert(app.queue.size() == 1);
+    app.Drain();
+    assert(app.camera_callbacks.size() == 1 && photo_notifications == notified);
+    assert(board.hint == "Connecting vision... / Double-click to exit");
+    const int previews_before_failure = board.preview_starts;
+    app.CompleteCameraSession(false);
+    assert(!board.photo_task_running_ && !board.photo_requested_ && photo_notifications == notified);
+    assert(board.preview_starts == previews_before_failure + 1);
+    assert(board.hint == "Vision unavailable. Press to retry / Double-click to exit");
+    board.CaptureAndExplainPhoto(); app.Drain();
+    assert(photo_notifications == notified);
+    app.CompleteCameraSession(true);
+    assert(board.photo_task_running_ && board.photo_requested_ && photo_notifications == notified + 1);
+    assert(board.photo_generation_ == board.page_generation_);
+    board.photo_task_running_ = false; board.photo_requested_ = false; // Worker completion boundary.
+    std::cout << "PASS: capture waits for session, duplicate requests coalesce, failure resumes and retry succeeds\n";
+
+    board.CaptureAndExplainPhoto(); board.ReturnHome(); app.Drain();
+    assert(!board.photo_task_running_ && !board.photo_requested_ && app.camera_callbacks.empty());
+    assert(photo_notifications == notified + 1); // Exit before queued preparation.
+    for (bool ready : {false, true}) {
+        Tick(); Click(board.home_overlay_, "AI Camera"); app.Drain();
+        board.CaptureAndExplainPhoto(); app.Drain();
+        assert(app.camera_callbacks.size() == 1);
+        board.ReturnHome(); app.Drain();
+        const int previews = board.preview_starts;
+        app.CompleteCameraSession(ready);
+        assert(!board.photo_task_running_ && !board.photo_requested_);
+        assert(board.preview_starts == previews && photo_notifications == notified + 1);
+    }
+    Tick(); Click(board.home_overlay_, "AI Camera"); app.Drain();
+    board.CaptureAndExplainPhoto(); app.Drain();
+    ++board.page_generation_; // A newer camera view invalidates the old request too.
+    const int previews = board.preview_starts;
+    app.CompleteCameraSession(true);
+    assert(!board.photo_task_running_ && !board.photo_requested_);
+    assert(board.preview_starts == previews + 1 && photo_notifications == notified + 1);
+    board.ReturnHome(); app.Drain(); Tick();
+    const int wakes = app.wake_calls;
+    Click(board.home_overlay_, "AI Chat"); app.Drain();
+    assert(board.app_mode_ == LichuangDevBoardML307::AppMode::kAiGuide);
+    assert(app.wake_calls == wakes + 1 && app.keep_alive);
+    board.ReturnHome(); app.Drain(); Tick();
+    board.DeleteOverlayLocked();
+    assert(!board.home_status_label_ && !board.home_chat_button_ && !board.home_camera_button_);
+    Tick(); Tick();
+    lv_timer_delete(board.home_status_timer_); board.home_status_timer_ = nullptr;
+    assert(TimerCount() == initial_timers && app.queue.empty() && app.camera_callbacks.empty());
+    std::cout << "PASS: camera page cancellation and home timer never use retired labels or dispatch stale photos\n";
+}
+
 int main() {
     std::cout << std::unitbuf;
     lv_init();
@@ -278,6 +421,8 @@ int main() {
     assert(flushes > 0);
     std::cout << "PASS: production overlay teardown removes timers and preserves font lifetime\n";
 
+    TestHomeAndCamera();
+
     // Exercise production entry/return generation checks with a queued cleanup.
     auto* trigger = lv_obj_create(lv_layer_top());
     lv_obj_add_event_cb(trigger, LichuangDevBoardML307::HomeScreenMusicClicked, LV_EVENT_CLICKED, &board);
@@ -329,6 +474,11 @@ int main() {
     board.ReturnHome(); app.Drain();
     assert(lock_depth == 0);
     lv_obj_delete(trigger);
+    board.DeleteOverlayLocked();
+    if (board.home_status_timer_) lv_timer_delete(board.home_status_timer_);
+    board.home_status_timer_ = nullptr;
+    Tick();
+    assert(TimerCount() == initial_timers);
     lv_display_delete(display);
     lv_deinit();
     std::cout << "PASS: queued Start/Back/volume generation cancellation and offline provisioning lifecycle\n";
@@ -343,7 +493,10 @@ def main():
     source = (BOARD / "lichuang_dev_board_ml307.cc").read_text(encoding="utf-8")
     methods = "\n".join(definition(source, name) for name in (
         "DeleteOverlayLocked", "HomeScreenMusicClicked", "EnterMusic", "ReturnHome",
-        "SetNetworkEventCallback"))
+        "SetNetworkEventCallback", "IsAiReady", "RefreshHomeReadinessLocked",
+        "HomeScreenGuideClicked", "HomeScreenPhotoClicked", "CaptureAndExplainPhoto"))
+    methods += "\n" + definition(source, "ShowHomeScreen").replace(
+        "void ShowHomeScreen()", "void RenderHomeScreen()", 1)
     actions = definition(source, "ShowMusicScreenLocked")
     back = actions[actions.index("actions.back ="):actions.index("actions.previous =")]
     volume = actions[actions.index("actions.volume ="):actions.index("actions.get_volume =")]
@@ -362,6 +515,7 @@ def main():
 #define LV_USE_FONT_PLACEHOLDER 0
 #define LV_FONT_FMT_TXT_LARGE 1
 #define LV_FONT_MONTSERRAT_14 1
+#define LV_FONT_MONTSERRAT_24 1
 #define LV_FONT_DEFAULT &lv_font_montserrat_14
 #define LV_USE_DEMO_WIDGETS 0
 """, encoding="utf-8")

@@ -198,6 +198,7 @@ void Application::Run() {
         auto bits = xEventGroupWaitBits(event_group_, ALL_EVENTS, pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (bits & MAIN_EVENT_ERROR) {
+            CancelCameraSession();
             CancelTtsCompletion();
             audio_service_.ResetDecoder();
             audio_service_.ResetEncoder();
@@ -314,6 +315,7 @@ void Application::Run() {
             clock_ticks_++;
             HandleReconnect();
             HandlePlaybackProgress();
+            HandleCameraPreparation();
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
@@ -359,12 +361,15 @@ void Application::HandleNetworkConnectedEvent() {
 
 void Application::HandleNetworkDisconnectedEvent() {
     network_connected_ = false;
+    const bool camera_was_active = camera_session_active_;
+    ++camera_request_generation_;
+    CancelCameraSession();
     reconnect_at_ms_ = 0;
     CancelTtsCompletion();
     audio_service_.ResetEncoder();
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
-    if (state == kDeviceStateConnecting || state == kDeviceStateListening ||
+    if (camera_was_active || state == kDeviceStateConnecting || state == kDeviceStateListening ||
         state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
         audio_service_.EnableVoiceProcessing(false);
@@ -372,7 +377,10 @@ void Application::HandleNetworkDisconnectedEvent() {
         if (protocol_) {
             protocol_->CloseAudioChannel();
         }
-        SetDeviceState(kDeviceStateIdle);
+        if (state == kDeviceStateIdle || state == kDeviceStateConnecting ||
+            state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            SetDeviceState(kDeviceStateIdle);
+        }
     }
 
     // Update the status bar immediately to show the network state
@@ -621,6 +629,7 @@ void Application::InitializeProtocol() {
             if (closed_generation != audio_channel_generation_.load()) {
                 return;
             }
+            CancelCameraSession();
             CancelTtsCompletion();
             audio_service_.ResetDecoder();
             audio_service_.ResetEncoder();
@@ -638,6 +647,7 @@ void Application::InitializeProtocol() {
             return;
         }
         if (strcmp(type->valuestring, "tts") == 0) {
+            if (camera_result_pending_) return;
             auto state = cJSON_GetObjectItem(root, "state");
             if (!cJSON_IsString(state)) {
                 ESP_LOGW(TAG, "Ignoring TTS message with invalid state");
@@ -649,7 +659,7 @@ void Application::InitializeProtocol() {
                 Schedule([this, channel_generation, conversation_generation]() {
                     if (channel_generation != audio_channel_generation_.load() ||
                         conversation_generation != conversation_generation_.load() ||
-                        !protocol_ || !protocol_->IsAudioChannelOpened()) {
+                        camera_result_pending_ || !protocol_ || !protocol_->IsAudioChannelOpened()) {
                         return;
                     }
                     CancelTtsCompletion();
@@ -663,7 +673,7 @@ void Application::InitializeProtocol() {
                 Schedule([this, channel_generation, conversation_generation]() {
                     if (channel_generation != audio_channel_generation_.load() ||
                         conversation_generation != conversation_generation_.load() ||
-                        !protocol_ || !protocol_->IsAudioChannelOpened()) {
+                        camera_result_pending_ || !protocol_ || !protocol_->IsAudioChannelOpened()) {
                         return;
                     }
                     if (GetDeviceState() != kDeviceStateSpeaking || aborted_ ||
@@ -800,6 +810,7 @@ void Application::StartListening() { xEventGroupSetBits(event_group_, MAIN_EVENT
 void Application::StopListening() { xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING); }
 
 void Application::HandleToggleChatEvent() {
+    if (camera_session_active_) return;
     auto state = GetDeviceState();
 
     if (state == kDeviceStateActivating) {
@@ -839,6 +850,7 @@ void Application::HandleToggleChatEvent() {
 }
 
 void Application::ContinueOpenAudioChannel(ListeningMode mode) {
+    if (camera_session_active_) return;
     // Check state again in case it was changed during scheduling
     if (GetDeviceState() != kDeviceStateConnecting) {
         return;
@@ -860,6 +872,7 @@ void Application::ContinueOpenAudioChannel(ListeningMode mode) {
 }
 
 void Application::HandleStartListeningEvent() {
+    if (camera_session_active_) return;
     auto state = GetDeviceState();
 
     if (state == kDeviceStateActivating) {
@@ -906,7 +919,7 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
-    if (!protocol_ || audio_service_.IsLocalPlaybackActive()) {
+    if (!protocol_ || camera_session_active_ || audio_service_.IsLocalPlaybackActive()) {
         return;
     }
 
@@ -951,6 +964,7 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
+    if (camera_session_active_) return;
     // Check state again in case it was changed during scheduling
     auto state = GetDeviceState();
     if (state != kDeviceStateConnecting && state != kDeviceStateIdle) {
@@ -986,6 +1000,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
+    if (camera_session_active_ && new_state == kDeviceStateListening) {
+        SetDeviceState(kDeviceStateIdle);
+        new_state = kDeviceStateIdle;
+    }
     clock_ticks_ = 0;
 
     auto& board = Board::GetInstance();
@@ -1002,7 +1020,7 @@ void Application::HandleStateChangedEvent() {
             audio_service_.SetKeepUplink(false);
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.ResetEncoder();
-            audio_service_.EnableWakeWordDetection(true);
+            audio_service_.EnableWakeWordDetection(!camera_session_active_);
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -1060,7 +1078,7 @@ void Application::HandleStateChangedEvent() {
                 audio_service_.SetKeepUplink(false);
                 audio_service_.EnableVoiceProcessing(false);
                 audio_service_.ResetEncoder();
-                audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+                audio_service_.EnableWakeWordDetection(!camera_session_active_ && audio_service_.IsAfeWakeWord());
             }
             break;
         case kDeviceStateWifiConfiguring:
@@ -1321,8 +1339,151 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) { audio_service_.PlaySound(sound); }
 
+void Application::CancelCameraSession() {
+    auto callback = std::move(camera_prepare_callback_);
+    camera_prepare_callback_ = nullptr;
+    camera_session_active_ = false;
+    camera_result_pending_ = false;
+    camera_session_ready_ = false;
+    camera_open_started_ = false;
+    if (callback) callback(false);
+}
+
+void Application::CompleteCameraPreparation(bool ready) {
+    // A request cancelled while OpenAudioChannel was blocked must never succeed.
+    const bool current = camera_prepare_generation_ == camera_request_generation_.load();
+    ready = ready && current;
+    auto callback = std::move(camera_prepare_callback_);
+    camera_prepare_callback_ = nullptr;
+    if (ready) {
+        camera_session_ready_ = true;
+        camera_ready_ms_ = esp_timer_get_time() / 1000;
+        ESP_LOGI(TAG, "Camera session ready with fresh vision capabilities");
+    } else {
+        if (current && camera_open_started_ && protocol_ &&
+            camera_channel_generation_ == audio_channel_generation_.load()) {
+            protocol_->CloseAudioChannel();
+            ++audio_channel_generation_;
+        }
+        camera_session_active_ = false;
+        camera_result_pending_ = false;
+        camera_session_ready_ = false;
+        camera_open_started_ = false;
+        ESP_LOGW(TAG, "Camera session preparation cancelled or unavailable");
+    }
+    auto state = GetDeviceState();
+    if (current && (state == kDeviceStateConnecting || state == kDeviceStateListening ||
+                    state == kDeviceStateSpeaking)) {
+        SetDeviceState(kDeviceStateIdle);
+    }
+    if (callback) callback(ready);
+}
+
+void Application::PrepareCameraSession(std::function<void(bool)> callback) {
+    if (!callback) return;
+    const auto request = ++camera_request_generation_;
+    const auto conversation = ++conversation_generation_;
+    Schedule([this, request, conversation, callback = std::move(callback)]() mutable {
+        if (request != camera_request_generation_.load() ||
+            conversation != conversation_generation_.load()) {
+            if (callback) callback(false);
+            return;
+        }
+        const auto now = esp_timer_get_time() / 1000;
+        // Tokens may expire. Only reuse a recent session prepared by this API.
+        const bool reuse = camera_session_active_ && camera_session_ready_ &&
+            protocol_ && protocol_->IsAudioChannelOpened() &&
+            camera_channel_generation_ == audio_channel_generation_.load() &&
+            now - camera_ready_ms_ < 10 * 60 * 1000;
+        CancelCameraSession();
+        camera_prepare_generation_ = request;
+        camera_prepare_callback_ = std::move(callback);
+        camera_prepare_deadline_ms_ = now + 10000;
+        camera_session_active_ = true;
+        camera_result_pending_ = true;
+        camera_session_ready_ = reuse;
+        camera_open_started_ = reuse;
+        keep_alive_ = false;
+        reconnect_at_ms_ = 0;
+        CancelTtsCompletion();
+        aborted_ = true;
+        listening_mode_ = kListeningModeManualStop;
+        audio_service_.SetKeepUplink(false);
+        audio_service_.EnableVoiceProcessing(false);
+        audio_service_.EnableWakeWordDetection(false);
+        audio_service_.ResetEncoder();
+        audio_service_.ResetDecoder();
+        auto state = GetDeviceState();
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            if (state == kDeviceStateSpeaking) protocol_->SendAbortSpeaking(kAbortReasonNone);
+            if (state == kDeviceStateListening) protocol_->SendStopListening();
+        }
+        if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
+            SetDeviceState(kDeviceStateIdle);
+        }
+        if (reuse) {
+            auto ready_callback = std::move(camera_prepare_callback_);
+            camera_prepare_callback_ = nullptr;
+            if (ready_callback) ready_callback(true);
+        } else {
+            HandleCameraPreparation();
+        }
+    });
+}
+
+void Application::HandleCameraPreparation() {
+    if (!camera_prepare_callback_) return;
+    if (camera_prepare_generation_ != camera_request_generation_.load()) {
+        CompleteCameraPreparation(false);
+        return;
+    }
+    if (esp_timer_get_time() / 1000 >= camera_prepare_deadline_ms_) {
+        ESP_LOGW(TAG, "Camera vision capability readiness timed out");
+        CompleteCameraPreparation(false);
+        return;
+    }
+    auto state = GetDeviceState();
+    if (state == kDeviceStateStarting || state == kDeviceStateActivating ||
+        state == kDeviceStateWifiConfiguring) {
+        // Activation owns these states. A clock tick retries without blocking MCP replies.
+        return;
+    }
+    if (!network_connected_ || !protocol_) {
+        CompleteCameraPreparation(false);
+        return;
+    }
+    if (!camera_open_started_) {
+        if (protocol_->IsAudioChannelOpened()) protocol_->CloseAudioChannel();
+        ++audio_channel_generation_;  // Invalidate the old socket's queued close callback.
+        camera_vision_baseline_ = McpServer::GetInstance().VisionCapabilityRevision();
+        camera_open_started_ = true;
+        SetDeviceState(kDeviceStateConnecting);
+        const bool opened = protocol_->OpenAudioChannel();
+        camera_channel_generation_ = audio_channel_generation_.load();
+        if (!opened || camera_prepare_generation_ != camera_request_generation_.load() ||
+            esp_timer_get_time() / 1000 >= camera_prepare_deadline_ms_) {
+            CompleteCameraPreparation(false);
+            return;
+        }
+        SetDeviceState(kDeviceStateIdle);
+    }
+    if (!protocol_->IsAudioChannelOpened() ||
+        camera_channel_generation_ != audio_channel_generation_.load()) {
+        CompleteCameraPreparation(false);
+        return;
+    }
+    // Server hello and MCP initialize are separate messages. Keep the main loop
+    // free to send initialize/tool replies while waiting for the latter.
+    if (McpServer::GetInstance().VisionCapabilityRevision() != camera_vision_baseline_) {
+        CompleteCameraPreparation(true);
+    }
+}
+
 void Application::ResetProtocol() {
-    Schedule([this]() {
+    const auto camera_generation = ++camera_request_generation_;
+    Schedule([this, camera_generation]() {
+        if (camera_generation != camera_request_generation_.load()) return;
+        CancelCameraSession();
         reconnect_at_ms_ = 0;
         CancelTtsCompletion();
         // Close audio channel if opened
@@ -1363,6 +1524,7 @@ void Application::NotifySTT(const std::string& text) {
             protocol_->CloseAudioChannel();
             return;
         }
+        camera_result_pending_ = false;
         protocol_->SendWakeWordDetected(text);
     });
 }
@@ -1380,8 +1542,12 @@ void Application::SetKeepAlive(bool enable) {
 void Application::EndConversation() {
     // Cancel retries immediately, even if an OpenAudioChannel call is in progress.
     keep_alive_ = false;
-    ++conversation_generation_;
-    Schedule([this]() {
+    const auto generation = ++conversation_generation_;
+    const auto camera_generation = ++camera_request_generation_;
+    Schedule([this, generation, camera_generation]() {
+        if (generation != conversation_generation_.load() ||
+            camera_generation != camera_request_generation_.load()) return;
+        CancelCameraSession();
         reconnect_at_ms_ = 0;
         reconnect_delay_ms_ = 2000;
         CancelTtsCompletion();
@@ -1397,6 +1563,11 @@ void Application::EndConversation() {
             protocol_->CloseAudioChannel();
         }
         ++audio_channel_generation_;
-        SetDeviceState(kDeviceStateIdle);
+        auto state = GetDeviceState();
+        if (state == kDeviceStateIdle || state == kDeviceStateConnecting ||
+            state == kDeviceStateListening || state == kDeviceStateSpeaking) {
+            SetDeviceState(kDeviceStateIdle);
+            audio_service_.EnableWakeWordDetection(true);
+        }
     });
 }

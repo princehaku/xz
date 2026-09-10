@@ -108,6 +108,7 @@ struct AudioService {
     std::function<void()> sample_rate_hook;
     void SetDecodeSampleRate(int,int) { if (sample_rate_hook) sample_rate_hook(); }
     void EnableVoiceProcessing(bool p) { processing = p; }
+    void EnableWakeWordDetection(bool) {}
     bool IsAudioProcessorRunning() { return processing; }
     bool IsVoiceDetected() { return speaking; }
     void PlaySound(const char*) {}
@@ -118,7 +119,7 @@ struct AudioService {
     bool EnqueueDecodePacket(std::unique_ptr<AudioStreamPacket>,bool,uint32_t);
     void PushTaskToEncodeQueue(AudioTaskType,std::vector<int16_t>&&);
 };
-enum DeviceState { kDeviceStateIdle, kDeviceStateConnecting, kDeviceStateListening, kDeviceStateSpeaking };
+enum DeviceState { kDeviceStateIdle, kDeviceStateConnecting, kDeviceStateListening, kDeviceStateSpeaking, kDeviceStateStarting, kDeviceStateActivating, kDeviceStateWifiConfiguring };
 enum ListeningMode { kListeningModeManualStop, kListeningModeRealtime };
 enum AbortReason { kAbortReasonNone };
 struct FakeLed { void OnStateChanged() {} };
@@ -142,6 +143,11 @@ struct Application {
     int64_t reconnect_at_ms_ = 0, audio_channel_opened_ms_ = 0;
     int reconnect_delay_ms_ = 2000, open_requests = 0;
     std::atomic<uint32_t> audio_channel_generation_{0}, conversation_generation_{0};
+    std::atomic<uint32_t> camera_request_generation_{0};
+    std::atomic<bool> camera_session_active_{false}, camera_result_pending_{false};
+    std::function<void(bool)> camera_prepare_callback_;
+    bool camera_session_ready_ = false, camera_open_started_ = false;
+    void CancelCameraSession();
     uint32_t tts_generation_ = 0, pending_tts_generation_ = 0;
     bool tts_completion_pending_ = false, tts_just_finished_ = false;
     bool vad_speech_pending_ = false, vad_speech_started_ = false;
@@ -311,7 +317,7 @@ head = re.sub(r"struct AudioTask \{[^\n]*\};", lambda _: audio_task, head)
 parts = [head]
 for name in ["ResetDecoder", "ResetEncoder", "IsPlaybackComplete", "OpusCodecTask", "AudioOutputTask", "PushPacketToDecodeQueue", "EnqueueDecodePacket", "PushTaskToEncodeQueue"]:
     parts.append(method("main/audio/audio_service.cc", "AudioService::" + name))
-for name in ["ScheduleReconnect", "HandleReconnect", "CancelTtsCompletion", "HandlePlaybackProgress", "NotifySTT", "EndConversation", "AbortSpeaking", "SetKeepAlive"]:
+for name in ["ScheduleReconnect", "HandleReconnect", "CancelTtsCompletion", "HandlePlaybackProgress", "NotifySTT", "EndConversation", "AbortSpeaking", "SetKeepAlive", "CancelCameraSession"]:
     parts.append(method("main/application.cc", "Application::" + name))
 application_source = (repo / "main/application.cc").read_text(encoding="utf-8")
 start = application_source.index('if (strcmp(state->valuestring, "start") == 0) {')
