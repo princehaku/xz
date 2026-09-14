@@ -6,8 +6,9 @@
 #include <cstdio>
 #include <vector>
 
-// Bounded, sequential single-RIFF MJPEG reader. The caller owns the FILE and
-// keeps it open for the reader's lifetime. Audio and AVI indexes are skipped.
+// Bounded, sequential single-RIFF MJPEG/PCM reader. The caller owns the FILE and
+// keeps it open for the reader's lifetime. Use a separate reader and FILE for
+// each stream: NextFrame and NextAudio share one cursor within each reader.
 class AviReader {
 public:
     struct Info {
@@ -16,12 +17,20 @@ public:
         uint32_t frame_interval_us = 0;
         uint32_t frame_count = 0;
         bool has_audio = false;
+        bool audio_supported = false;
+        uint32_t audio_sample_rate = 0;
+        uint16_t audio_channels = 0;
+        uint16_t audio_bits_per_sample = 0;
+        uint32_t audio_sample_count = 0;
     };
-    enum class Result { kFrame, kEnd, kError };
+    enum class Result { kFrame, kAudio, kEnd, kError };
 
     bool Open(FILE* file);
     const Info& info() const { return info_; }
     Result NextFrame(std::vector<uint8_t>& jpeg);
+    // Returns interleaved signed 16-bit LE PCM bytes, at most 256 KiB per call.
+    // No audio returns kEnd; an unsupported audio format returns kError.
+    Result NextAudio(std::vector<uint8_t>& pcm);
 
 private:
     struct Chunk {
@@ -42,8 +51,11 @@ private:
     std::array<List, 8> lists_{};
     size_t depth_ = 0;
     uint32_t video_stream_ = 0;
+    uint32_t audio_stream_ = 0;
     uint32_t frames_read_ = 0;
+    uint32_t audio_samples_read_ = 0;
     uint32_t remaining_chunks_ = 0;
+    uint8_t stream_mode_ = 0;
     bool failed_ = true;
 
     bool Read(uint64_t offset, void* data, size_t size);
@@ -51,4 +63,5 @@ private:
     bool ParseHeaders(const Chunk& header);
     bool ParseStream(const Chunk& stream, uint32_t index, bool& selected);
     bool ValidateJpeg(const std::vector<uint8_t>& jpeg) const;
+    Result NextPacket(std::vector<uint8_t>& data, bool audio);
 };

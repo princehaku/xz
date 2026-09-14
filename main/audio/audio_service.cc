@@ -377,10 +377,16 @@ void AudioService::AudioOutputTask() {
             codec_->EnableOutput(true);
         }
 
+        const size_t submitted_samples = task->pcm.size();
         codec_->OutputData(task->pcm);
 
         /* Update the last output time */
         lock.lock();
+        if (local && task->generation == local_playback_token_) {
+            // OutputData has no success return; this measures codec submission,
+            // while hardware DMA may still be playing the submitted samples.
+            local_playback_samples_ += submitted_samples;
+        }
         last_output_time_ = std::chrono::steady_clock::now();
         playing_ = false;
         audio_queue_cv_.notify_all();
@@ -879,6 +885,7 @@ uint32_t AudioService::BeginLocalPlayback() {
         token = ++local_playback_sequence_;
         if (token == 0) token = ++local_playback_sequence_;
         local_playback_token_ = token;
+        local_playback_samples_ = 0;
         local_playback_paused_ = false;
         ++decode_generation_;
         ++encode_generation_;
@@ -943,6 +950,11 @@ void AudioService::EndLocalPlayback(uint32_t token) {
         audio_queue_cv_.notify_all();
     }
     std::lock_guard<std::mutex> output_lock(output_mutex_);
+}
+
+uint64_t AudioService::GetLocalPlaybackSamples(uint32_t token) {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return token != 0 && token == local_playback_token_ ? local_playback_samples_ : 0;
 }
 
 void AudioService::ResetEncoder() {

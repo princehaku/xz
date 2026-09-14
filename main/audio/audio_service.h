@@ -145,6 +145,9 @@ public:
     bool PushLocalPcm(uint32_t token, std::vector<int16_t>& pcm);
     void PauseLocalPlayback(uint32_t token, bool paused);
     void EndLocalPlayback(uint32_t token);
+    // Mono samples submitted through the codec for the current token; stale/zero
+    // tokens return 0. Hardware DMA may add bounded latency after submission.
+    uint64_t GetLocalPlaybackSamples(uint32_t token);
     bool IsLocalPlaybackActive() const { return local_playback_token_.load() != 0; }
     void SetModelsList(srmodel_list_t* models_list);
 
@@ -192,6 +195,7 @@ private:
     std::atomic<uint32_t> decode_generation_{0};
     std::atomic<uint32_t> local_playback_token_{0};
     uint32_t local_playback_sequence_ = 0;
+    uint64_t local_playback_samples_ = 0;  // Protected by audio_queue_mutex_.
     bool local_playback_paused_ = false;
     uint32_t encode_generation_ = 0;
     bool decoding_ = false;

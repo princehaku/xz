@@ -9,29 +9,33 @@
 3. 下载完成后自动播放；网页可查看进度、暂停/继续、停止或重新扫描。屏幕也提供返回、上一段、暂停和下一段。
 4. 停止后文件保存在 `/video/test.avi`，以后可以离线播放。音乐原有 MP3/PCM WAV 功能继续可用。
 
-播放器支持单 RIFF 的 MJPG/baseline JPEG AVI，最大 320×240、1–30 fps、单帧最多 256 KiB。首版只播放画面，AVI 音轨会跳过；进入本地播放会暂停 AI 语音和唤醒，返回主页恢复语音入口。下载要求 HTTP 200 和有效 Content-Length，最大 16 MiB；暂不支持需要登录或重定向的下载页。
+播放器支持单 RIFF 的 MJPG/baseline JPEG AVI，最大 320×240、1–30 fps、单帧最多 256 KiB。AVI 音轨支持 16 位小端 PCM、单声道或双声道及常见采样率；采样率需在 8–48 kHz 范围内，且为 4,000 或 11,025 Hz 的整数倍。输出转换为开发板使用的 16 kHz 单声道。未带音轨的视频可正常播放画面；不支持的音频编码会显示错误提示。屏幕角标显示 `AVI / PCM audio` 或 `AVI / silent`，用于区分文件是否包含可播放音轨。
 
-下载按 4 KiB 分块写入临时文件 `/video/test.part`，完整检查 AVI 结构、帧数及各帧 JPEG 格式，并验证首帧可解码后才提交。覆盖已有测试视频时先保留 `test-backup.avi`，重命名失败会尝试恢复。其它用户文件不参与替换，挂载失败不会格式化卡。
+进入本地播放会暂停 AI 语音和唤醒，返回主页恢复语音入口。下载要求 HTTP 200 和有效 Content-Length，最大 16 MiB；暂不支持需要登录或重定向的下载页。
+
+下载按 4 KiB 分块写入临时文件 `/video/test.part`，完整检查 AVI 结构、帧数及各帧 JPEG 格式，检查 PCM 格式、块对齐和完整采样数，并验证首帧可解码后才提交。覆盖已有测试视频时先保留 `test-backup.avi`，重命名失败会尝试恢复。其它用户文件不参与替换，挂载失败不会格式化卡。
 
 断电遗留的 `test.part` 或 `test-backup.avi` 会保留并阻止对应替换操作，避免误覆盖；需要检查后清理。停止会立即取消界面及帧发布，底层 DNS/网络连接结束后才会释放下载任务和 SD 资源，因此不可达网址可能延迟重扫或下一次操作。
 
-局域网页面在 Wi-Fi 连接后启动，断开后关闭。写操作需要本次服务的随机 token，页面自动携带；未开放跨域访问。可以通过设备 MCP 工具 `self.sd_video.download` 提交 `url`，通过 `self.sd_video.status` 查看结果。网页的 202/queued 只说明请求已排队，下载完成需要查看状态或串口日志。
+局域网页面在 Wi-Fi 连接后启动，断开后关闭。写操作需要本次服务的随机 token，页面自动携带；未开放跨域访问。可以通过设备 MCP 工具 `self.sd_video.download` 提交 `url`，通过 `self.sd_video.status` 查看结果。状态中的 `has_audio` 表示视频包含可播放音轨，`audio_samples` 记录本轮已提交到 codec 的单声道采样数，在输出调用返回后累计；DMA 缓冲仍可能增加约 90 ms 延迟，该计数不能代替扬声器听音验证。网页的 202/queued 只说明请求已排队，下载完成需要查看状态或串口日志。
 
 ## 测试样片
 
-本次准备的 `tmp/video-test/big_buck_bunny_320x240_10fps_mjpeg_pcm.avi` 为 12 秒、120 帧、320×240、10 fps，约 1.65 MiB。
+本次准备的 `tmp/video-test/big_buck_bunny_320x240_10fps_mjpeg_pcm.avi` 为 12 秒、120 帧、320×240、10 fps，约 1.65 MiB，包含 16 kHz、16 位单声道 PCM 音轨。
 
 来源为 Blender Foundation 的 [Big Buck Bunny](https://peach.blender.org/about/)，采用 [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/) 许可。署名：(c) copyright 2008, Blender Foundation / www.bigbuckbunny.org。取原片 00:30–00:42，降低帧率、保留宽高比加黑边、转 MJPEG；详细来源和 SHA-256 见样片目录 `README.txt`。
 
 ## 验证
 
 - `python3 scripts/tests/test_avi_reader.py`：真实 120 帧样片，以及 RIFF/流选择/尺寸/帧数/坏 JPEG/截断/扫描预算等边界。
-- `python3 scripts/tests/test_sd_video.py`：真实 AVI 解析器与生产下载/播放代码，验证网络错误、坏文件、写盘错误、旧文件回滚、取消及视频帧生命周期。网络、JPEG 解码和硬件为宿主 stub。
+- `python3 scripts/tests/test_sd_video.py`：真实 AVI 解析器与生产下载/播放代码，验证网络错误、坏文件、写盘错误、旧文件回滚、取消及视频帧生命周期。音频覆盖 PCM16 单声道样本精确一致、48 kHz 双声道下混和重采样调用、队列限长与重试、音频时钟、音画暂停/继续、取消在途音频及坏音轨下载保护。网络、JPEG 解码、重采样器及按时钟消费 PCM 的 codec 为宿主 stub。
 - `python3 scripts/tests/test_sd_music.py`：现有音频功能回归。
-- `python3 scripts/tests/test_sd_music_screen.py`：真实 LVGL 的下载进度、RGB565 帧替换与暂停、页面退出及原有主页/相机回归。
+- `python3 scripts/tests/test_sd_music_screen.py`：真实 LVGL 的下载进度、有声/无音轨角标、RGB565 帧替换与暂停、页面退出及原有主页/相机回归。
 
-宿主回归使用 WSL 的 g++、ASan 和 UBSan，AVI 读取器共 653 个用例通过。
+宿主回归使用 WSL 的 g++、ASan 和 UBSan。音轨扩展的 AVI 读取器通过 715 个 AVI 用例、63 个 PCM 用例及实际样片的 120 帧画面和 192000 个音频采样。音频服务的进度计数、暂停及旧 token 隔离回归也已通过。
 
-2026-09-14 已完成实板验证：ESP32-S3 v0.2、8 MiB PSRAM，通过 Wi-Fi 下载 1,727,884 字节样片到 TF 卡，完整校验后自动循环播放。用户确认屏幕有画面；串口记录每轮 120 帧、约 12.23 秒、9.81 fps。暂停期间帧数和进度保持不变，继续和返回有效。关闭电脑样片服务、更新固件并重启后，仍可从卡中重新播放。局域网控制接口拒绝未携带 token 的 POST（403）。当前仍为无声播放。
+2026-09-14 初版已完成实板验证：ESP32-S3 v0.2、8 MiB PSRAM，通过 Wi-Fi 下载 1,727,884 字节样片到 TF 卡，完整校验后自动循环播放。用户确认屏幕有画面；串口记录每轮 120 帧、约 12.23 秒、9.81 fps。暂停期间帧数和进度保持不变，继续和返回有效。关闭电脑样片服务、更新固件并重启后，仍可从卡中重新播放。局域网控制接口拒绝未携带 token 的 POST（403）。以上记录来自仅播放画面的初版固件。
+
+同日音轨扩展已编译并烧录实板，直接读取卡中原样片。连续多轮均输出 192000 个 PCM 采样，周期约 12.13–12.22 秒，设备原有音量为 100%。播放器以音频提交进度安排视频，在本次负载下每轮跳过约 15–20 个过时画面；日志的 120 帧包含这些跳帧，不能视为实际显示帧数。实板暂停 1.5 秒时画面帧号、音频采样计数、进度均冻结；继续恢复采样，停止清空音视频状态，重新播放从 SD 卡开始。短时观察无崩溃或音频写入错误日志。此记录证明音轨已送入 codec，扬声器是否可闻仍待用户确认。
 
 烧录只更新 `ota_0` 的应用地址 `0x20000`，保留原分区表、NVS 配网信息及资源分区。原设备应用和测试日志保留在本机忽略目录 `tmp/video-test/`，不进入版本库。

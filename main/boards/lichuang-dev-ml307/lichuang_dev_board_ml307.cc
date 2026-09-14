@@ -1034,6 +1034,8 @@ private:
         cJSON_AddBoolToObject(json, "is_video", snapshot.is_video);
         cJSON_AddNumberToObject(json, "download_percent", snapshot.download_percent);
         cJSON_AddNumberToObject(json, "video_frames", snapshot.video_frames);
+        cJSON_AddBoolToObject(json, "has_audio", snapshot.video_has_audio);
+        cJSON_AddNumberToObject(json, "audio_samples", snapshot.video_audio_samples);
         cJSON_AddNumberToObject(json, "elapsed_seconds", snapshot.elapsed_seconds);
         auto* encoded = cJSON_PrintUnformatted(json);
         std::string result = encoded ? encoded : "{}";
@@ -1075,7 +1077,7 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.sd_video.download",
-            "Download an HTTP(S) baseline MJPEG AVI to the SD card and play it silently. "
+            "Download an HTTP(S) baseline MJPEG AVI to the SD card and play it with optional PCM audio. "
             "Maximum 320x240, 30 fps and 16 MiB. Query self.sd_video.status for completion.",
             PropertyList({Property("url", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {

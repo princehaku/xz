@@ -2,7 +2,7 @@
 """Compile the production AVI reader on a host; no ESP-IDF or hardware access.
 
 Run with Python 3 and g++ on Linux/WSL. ASan and UBSan cover malformed RIFF,
-stream selection, bounded JPEG headers, padding, nesting and frame counts.
+stream selection, bounded JPEG/PCM payloads, padding, nesting and stream counts.
 The prepared Big Buck Bunny sample is also checked when present (--sample can
 select its location). Synthetic JPEG fixtures test framing, not JPEG decoding.
 """
@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> jpeg{1, 2, 3};
     assert(!reader.Open(nullptr));
     assert(reader.NextFrame(jpeg) == AviReader::Result::kError && jpeg.empty());
+    assert(reader.NextAudio(jpeg) == AviReader::Result::kError && jpeg.empty());
     while (manifest >> filename >> expected >> audio) {
         FILE* file = fopen((root + "/" + filename).c_str(), "rb");
         assert(file);
@@ -81,6 +82,63 @@ int main(int argc, char** argv) {
     }
     std::cout << "PASS: " << checked << " AVI fixtures, stream selection, limits, padding, "
               << "JPEG safety, malformed input and reader reuse\n";
+    std::ifstream audio_manifest(root + "/audio_manifest.txt");
+    assert(audio_manifest);
+    unsigned rate, channels, supported, has_audio, expected_hash;
+    checked = 0;
+    while (audio_manifest >> filename >> expected >> supported >> rate >> channels >>
+           has_audio >> expected_hash) {
+        FILE* file = fopen((root + "/" + filename).c_str(), "rb");
+        assert(file && reader.Open(file));
+        assert(reader.info().has_audio == static_cast<bool>(has_audio));
+        assert(reader.info().audio_supported == static_cast<bool>(supported));
+        if (supported) {
+            assert(reader.info().audio_sample_rate == rate);
+            assert(reader.info().audio_channels == channels);
+            assert(reader.info().audio_bits_per_sample == 16);
+            if (expected >= 0)
+                assert(reader.info().audio_sample_count == static_cast<unsigned>(expected));
+        }
+        unsigned samples = 0;
+        uint32_t hash = 2166136261U;
+        AviReader::Result result;
+        do {
+            result = reader.NextAudio(jpeg);
+            if (result == AviReader::Result::kAudio) {
+                assert(supported && !jpeg.empty() && jpeg.size() <= 256 * 1024);
+                assert(jpeg.size() % (channels * 2) == 0);
+                samples += jpeg.size() / (channels * 2);
+                assert(samples <= reader.info().audio_sample_count);
+                for (uint8_t byte : jpeg) hash = (hash ^ byte) * 16777619U;
+            } else {
+                assert(jpeg.empty());
+            }
+        } while (result == AviReader::Result::kAudio);
+        if ((expected < 0 && result != AviReader::Result::kError) ||
+            (expected >= 0 && (result != AviReader::Result::kEnd ||
+                              samples != static_cast<unsigned>(expected) || hash != expected_hash))) {
+            std::cerr << "Audio failed: " << filename << " samples=" << samples << '\n';
+            assert(false);
+        }
+        assert(reader.NextAudio(jpeg) == result && jpeg.empty());
+        assert(fseek(file, 0, SEEK_SET) == 0 && fclose(file) == 0);
+        ++checked;
+    }
+    // Independent handles can consume the two streams at different speeds.
+    FILE* video_file = fopen((root + "/pcm_mono.avi").c_str(), "rb");
+    FILE* audio_file = fopen((root + "/pcm_mono.avi").c_str(), "rb");
+    AviReader audio_reader;
+    assert(video_file && audio_file && reader.Open(video_file) && audio_reader.Open(audio_file));
+    assert(reader.NextFrame(jpeg) == AviReader::Result::kFrame);
+    assert(audio_reader.NextAudio(jpeg) == AviReader::Result::kAudio);
+    assert(reader.NextFrame(jpeg) == AviReader::Result::kEnd);
+    assert(audio_reader.NextAudio(jpeg) == AviReader::Result::kAudio);
+    assert(audio_reader.NextAudio(jpeg) == AviReader::Result::kEnd);
+    // Mixing cursor modes cannot accidentally succeed with partial stream data.
+    assert(audio_reader.NextFrame(jpeg) == AviReader::Result::kError && jpeg.empty());
+    assert(fclose(video_file) == 0 && fclose(audio_file) == 0);
+    std::cout << "PASS: " << checked << " PCM fixtures, exact samples/bytes, independent cursors, "
+              << "unsupported metadata, truncation and allocation bounds\n";
 }
 '''
 
@@ -122,6 +180,48 @@ def stream(kind=b"vids", codec=b"MJPG", width=320, height=240, scale=1, rate=10,
     return listing(b"strl", prefix + chunk(b"strh", header) + chunk(b"strf", fmt) + suffix)
 
 
+def pcm_stream(channels=1, sample_rate=16000, count=4, format_tag=1, bits=16,
+               alignment=None, byte_rate=None, scale=1, rate=None, start=0,
+               sample_size=None, format_tail=b"", truncate_format=None):
+    alignment = channels * 2 if alignment is None else alignment
+    byte_rate = sample_rate * alignment if byte_rate is None else byte_rate
+    rate = sample_rate * scale if rate is None else rate
+    sample_size = alignment if sample_size is None else sample_size
+    header = bytearray(56)
+    header[:4] = b"auds"
+    struct.pack_into("<IIII", header, 20, scale, rate, start, count)
+    struct.pack_into("<I", header, 44, sample_size)
+    fmt = struct.pack("<HHIIHH", format_tag, channels, sample_rate, byte_rate,
+                      alignment, bits) + format_tail
+    if truncate_format is not None:
+        fmt = fmt[:truncate_format]
+    return listing(b"strl", chunk(b"strh", header) + chunk(b"strf", fmt))
+
+
+def fnv1a(data):
+    value = 2166136261
+    for byte in data:
+        value = ((value ^ byte) * 16777619) & 0xFFFFFFFF
+    return value
+
+
+def movie_audio(data):
+    """Independently collect stream 01 PCM from the prepared sample for exact comparison."""
+    def walk(start, end):
+        result = b""
+        while start < end:
+            kind, size = struct.unpack_from("<4sI", data, start)
+            body = start + 8
+            assert body + size <= end
+            if kind == b"LIST" and data[body:body + 4] in (b"movi", b"rec "):
+                result += walk(body + 4, body + size)
+            elif kind == b"01wb":
+                result += data[body:body + size]
+            start = body + size + (size & 1)
+        return result
+    return walk(12, len(data))
+
+
 def headers(streams=None, width=320, height=240, interval=100000, count=1, extra=b""):
     streams = [stream(count=count)] if streams is None else streams
     avih = bytearray(56)
@@ -144,9 +244,91 @@ def main():
                         "tmp/video-test/big_buck_bunny_320x240_10fps_mjpeg_pcm.avi")
     args = parser.parse_args()
     cases = []
+    audio_cases = []
 
     def add(name, data, expected=-1, audio=False):
         cases.append((name, data, expected, int(audio)))
+
+    def add_pcm(name, data, samples=-1, supported=True, rate=16000, channels=1,
+                payload=b"", video_frames=1, has_audio=True):
+        add(name, data, video_frames, has_audio)
+        audio_cases.append((name, samples, int(supported), rate, channels,
+                            int(has_audio), fnv1a(payload)))
+
+    pcm = struct.pack("<hhhh", -32768, -1234, 1234, 32767)
+    pcm_header = headers([stream(), pcm_stream()])
+    pcm_chunks = chunk(b"01wb", pcm[:4]) + chunk(b"00dc", jpeg()) + chunk(b"01wb", pcm[4:])
+    add_pcm("pcm_mono.avi", avi(pcm_chunks, pcm_header), 4, payload=pcm)
+    add_pcm("pcm_waveformatex.avi", avi(pcm_chunks, headers([
+        stream(), pcm_stream(format_tail=b"\0\0")])), 4, payload=pcm)
+    stereo = struct.pack("<hhhhhhhh", -32768, 32767, -1, 1, 0, 1000, 2000, -2000)
+    for rate in (8000, 11025, 22050, 44100, 48000):
+        add_pcm(f"pcm_stereo_{rate}.avi", avi(chunk(b"00dc", jpeg()) + chunk(b"01wb", stereo),
+            headers([stream(), pcm_stream(channels=2, sample_rate=rate, scale=4)])),
+            4, channels=2, rate=rate, payload=stereo)
+    add_pcm("pcm_audio_first.avi", avi(chunk(b"00wb", pcm) + chunk(b"01dc", jpeg()),
+        headers([pcm_stream(), stream()])), 4, payload=pcm)
+    add_pcm("pcm_first_of_two.avi", avi(pcm_chunks + chunk(b"02wb", b"ignored"),
+        headers([stream(), pcm_stream(), pcm_stream(format_tag=3)])), 4, payload=pcm)
+    add_pcm("pcm_stream_ten.avi", avi(chunk(b"00dc", jpeg()) + chunk(b"10wb", pcm),
+        headers([stream()] * 10 + [pcm_stream()])), 4, payload=pcm)
+    add_pcm("pcm_nested.avi", avi(listing(b"rec ", pcm_chunks), pcm_header), 4, payload=pcm)
+    add_pcm("pcm_skip_bad_jpeg.avi", avi(chunk(b"00dc", b"invalid") + chunk(b"01wb", pcm),
+        pcm_header), 4, payload=pcm, video_frames=-1)
+    add_pcm("pcm_no_audio.avi", avi(), 0, supported=False, has_audio=False)
+    maximum_pcm = bytes(range(256)) * 1024
+    add_pcm("pcm_maximum.avi", avi(chunk(b"00dc", jpeg()) + chunk(b"01wb", maximum_pcm),
+        headers([stream(), pcm_stream(count=len(maximum_pcm) // 2)])),
+        len(maximum_pcm) // 2, payload=maximum_pcm)
+    for label, options in [
+        ("format_float", {"format_tag": 3}),
+        ("format_adpcm", {"format_tag": 2}),
+        ("eight_bit", {"bits": 8}),
+        ("24_bit", {"bits": 24}),
+        ("zero_channels", {"channels": 0}),
+        ("surround", {"channels": 6}),
+        ("low_rate", {"sample_rate": 7999}),
+        ("high_rate", {"sample_rate": 48001}),
+        ("unsupported_rate_9000", {"sample_rate": 9000}),
+        ("unsupported_rate_12001", {"sample_rate": 12001}),
+        ("bad_alignment", {"alignment": 3}),
+        ("bad_byte_rate", {"byte_rate": 1}),
+        ("bad_time_base", {"rate": 1234}),
+        ("zero_scale", {"scale": 0}),
+        ("overflow_scale", {"scale": 0xFFFFFFFF, "rate": 16000}),
+        ("nonzero_start", {"start": 1}),
+        ("bad_sample_size", {"sample_size": 0}),
+        ("zero_count", {"count": 0}),
+        ("huge_count", {"count": 0xFFFFFFFF}),
+        ("short_extension", {"format_tail": b"\0"}),
+        ("nonempty_extension", {"format_tail": b"\x01\0\0"}),
+    ]:
+        add_pcm(f"pcm_unsupported_{label}.avi", avi(pcm_chunks,
+            headers([stream(), pcm_stream(**options)])), supported=False)
+    for length in range(16):
+        add_pcm(f"pcm_format_cut_{length}.avi", avi(pcm_chunks,
+            headers([stream(), pcm_stream(truncate_format=length)])), supported=False)
+    for label, payload in [
+        ("unaligned", chunk(b"01wb", pcm[:-1])),
+        ("empty", chunk(b"01wb", b"")),
+        ("missing", b""),
+        ("short_count", chunk(b"01wb", pcm[:-2])),
+        ("extra_count", chunk(b"01wb", pcm + b"\0\0")),
+        ("wrong_stream", chunk(b"02wb", pcm)),
+        ("wrong_suffix", chunk(b"01dc", pcm)),
+    ]:
+        add_pcm(f"pcm_invalid_{label}.avi", avi(chunk(b"00dc", jpeg()) + payload, pcm_header))
+    oversize_pcm = maximum_pcm + b"\0\0"
+    add_pcm("pcm_oversize.avi", avi(chunk(b"00dc", jpeg()) + chunk(b"01wb", oversize_pcm),
+        headers([stream(), pcm_stream(count=len(oversize_pcm) // 2)])))
+    add_pcm("pcm_chunk_boundary.avi", avi(chunk(b"00dc", jpeg()) +
+        listing(b"rec ", b"01wb" + le32(100)) + chunk(b"JUNK", b"x" * 100), pcm_header),
+        video_frames=-1)
+    add_pcm("pcm_budget.avi", avi(chunk(b"00dc", jpeg()) + chunk(b"JUNK", b"") * 4096 +
+        chunk(b"01wb", pcm), pcm_header), video_frames=-1)
+    add_pcm("pcm_budget_resets.avi", avi(chunk(b"00dc", jpeg()) +
+        (chunk(b"JUNK", b"") * 4090 + chunk(b"01wb", pcm[:4])) * 2, pcm_header),
+        4, payload=pcm[:4] * 2, video_frames=-1)
 
     add("minimal.avi", avi(), 1)
     add("no_index.avi", avi(extra=chunk(b"JUNK", b"odd")), 1)
@@ -245,7 +427,10 @@ def main():
     for length in range(12, len(valid)):
         add(f"riff_cut_{length}.avi", valid[:4] + le32(length - 8) + valid[8:length])
     if args.sample.exists():
-        add("big_buck_bunny.avi", args.sample.read_bytes(), 120, True)
+        sample = args.sample.read_bytes()
+        sample_pcm = movie_audio(sample)
+        assert len(sample_pcm) == 192000 * 2
+        add_pcm("big_buck_bunny.avi", sample, 192000, payload=sample_pcm, video_frames=120)
     else:
         print(f"SKIP: prepared 120-frame sample is absent: {args.sample}", flush=True)
     with tempfile.TemporaryDirectory(prefix="avi-reader-test-") as name:
@@ -256,6 +441,8 @@ def main():
             (directory / filename).write_bytes(data)
             manifest.append(f"{filename} {expected} {audio}\n")
         (directory / "manifest.txt").write_text("".join(manifest), encoding="utf-8")
+        (directory / "audio_manifest.txt").write_text(
+            "".join(" ".join(map(str, row)) + "\n" for row in audio_cases), encoding="utf-8")
         binary = directory / "test"
         subprocess.run([os.environ.get("CXX", "g++"), "-std=c++17", "-Wall", "-Wextra", "-Werror",
                         "-g", "-fsanitize=address,undefined", "-I", str(BOARD),
@@ -263,7 +450,7 @@ def main():
                         "-o", str(binary)], check=True)
         subprocess.run([str(binary), str(directory)], check=True, timeout=30)
         if args.sample.exists():
-            print("PASS: real MJPEG + PCM sample has 120 validated 320x240 frames at 10 fps")
+            print("PASS: real sample has 120 validated 320x240 frames and 192000 exact mono PCM samples")
 
 
 if __name__ == "__main__":

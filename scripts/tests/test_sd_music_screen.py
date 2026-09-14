@@ -355,6 +355,7 @@ int main() {
     live_root = root;
     SdMusicPlayer player;
     int back = 0, previous = 0, next = 0, rescans = 0, toggles = 0, volume = 55;
+    std::string portal_address;
     SdMusicScreen::Actions actions;
     actions.back = [&] { ++back; };
     actions.previous = [&] { ++previous; };
@@ -363,6 +364,7 @@ int main() {
     actions.toggle = [&] { ++toggles; };
     actions.volume = [&](int delta) { volume += delta; };
     actions.get_volume = [&] { return volume; };
+    actions.portal_address = [&] { return portal_address; };
     auto screen = std::make_unique<SdMusicScreen>(root, player, std::move(actions));
     screen->SetFont(std::make_shared<LvglBuiltInFont>(&font_noto_basic_20_4));
     Tick();
@@ -375,6 +377,13 @@ int main() {
     Click(root, "Close");
     Tick();
     assert(lv_obj_get_child_count(root) == media_children);
+    portal_address = "http://192.168.1.3:8080/";
+    Click(root, "Download AVI");
+    Tick();
+    assert(Find(root, "Open on a phone or PC\non the same Wi-Fi:\nhttp://192.168.1.3:8080/\n\nEnter the AVI download URL.\nMJPEG, up to 320 x 240.\nAudio: 16-bit PCM, 8-48 kHz."));
+    AssertBounds(lv_obj_get_child(root, -1));
+    Click(root, "Close");
+    Tick();
     for (const auto state : {SdMusicPlayer::State::kNoCard, SdMusicPlayer::State::kEmpty,
                              SdMusicPlayer::State::kError, SdMusicPlayer::State::kScanning}) {
         player.snapshot.state = state;
@@ -384,6 +393,10 @@ int main() {
         AssertBounds(root);
     }
     std::cout << "PASS: real 320x240 LVGL layout; no-card/empty/error/scanning controls\n";
+    player.snapshot.state = SdMusicPlayer::State::kError;
+    player.snapshot.message = "AVI audio must be 16-bit PCM";
+    Tick();
+    assert(Find(root, "AVI audio must be 16-bit PCM"));
 
     player.snapshot = {SdMusicPlayer::State::kPlaying, "Moonlight", 1, 3, 65, "Playing"};
     Tick();
@@ -410,6 +423,10 @@ int main() {
     Tick();
     auto* overlay = lv_obj_get_child(root, -1);
     assert(!lv_obj_has_flag(overlay, LV_OBJ_FLAG_HIDDEN));
+    assert(Find(overlay, "AVI / silent"));
+    player.snapshot.video_has_audio = true;
+    Tick();
+    assert(Find(overlay, "AVI / PCM audio") && !Find(overlay, "AVI / silent"));
     auto* picture = lv_obj_get_child(overlay, 0);
     auto* descriptor = static_cast<const lv_image_dsc_t*>(lv_image_get_src(picture));
     assert(descriptor && descriptor->header.w == 320 && descriptor->data[0] == 0xf8);
@@ -424,11 +441,15 @@ int main() {
     player.snapshot.state = SdMusicPlayer::State::kPaused;
     Tick();
     assert(lv_image_get_src(picture) == descriptor && !lv_obj_has_flag(overlay, LV_OBJ_FLAG_HIDDEN));
+    assert(Find(overlay, "AVI / PCM audio"));
+    player.snapshot.video_has_audio = false;
+    Tick();
+    assert(Find(overlay, "AVI / silent") && !Find(overlay, "AVI / PCM audio"));
     player.frame.reset();
     player.snapshot.is_video = false;
     Tick();
     assert(lv_obj_has_flag(overlay, LV_OBJ_FLAG_HIDDEN));
-    std::cout << "PASS: download progress and RGB565 video replacement/pause/frame lifetime\n";
+    std::cout << "PASS: download progress, audio/silent badge and RGB565 video replacement/pause/frame lifetime\n";
     player.snapshot.title = "中文歌曲";
     Tick();
     assert(Find(root, "Track 2"));
@@ -441,6 +462,10 @@ int main() {
     Tick();
     assert(Find(root, "中文歌曲") && Find(root, "已暂停") && Find(root, "音量 55%"));
     AssertBounds(root);
+    player.snapshot.state = SdMusicPlayer::State::kError;
+    player.snapshot.message = "AVI audio must be 16-bit PCM";
+    Tick();
+    assert(Find(root, "AVI audio must be 16-bit PCM"));
     auto b = std::make_shared<OwnedFont>(destroyed_b);
     screen->SetFont(b);
     assert(destroyed_a == 1);

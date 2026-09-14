@@ -96,6 +96,7 @@ struct AudioService {
     std::deque<uint32_t> timestamp_queue_;
     std::atomic<uint32_t> decode_generation_{0}; uint32_t encode_generation_ = 0;
     std::atomic<uint32_t> local_playback_token_{0}; bool local_playback_paused_ = false;
+    uint64_t local_playback_samples_ = 0;
     bool IsLocalPlaybackActive() const { return local_playback_token_.load() != 0; }
     std::atomic<bool> service_stopped_{false}, keep_uplink_{false};
     bool decoding_ = false, playing_ = false, processing = false, speaking = false;

@@ -28,6 +28,8 @@ public:
         bool is_video = false;
         int download_percent = 0;
         uint32_t video_frames = 0;
+        bool video_has_audio = false;
+        uint32_t video_audio_samples = 0;
     };
     struct VideoFrame {
         std::vector<uint8_t> pixels;

@@ -185,6 +185,8 @@ void SdMusicPlayer::RestartLocked(bool scan) {
     snapshot_.is_video = false;
     snapshot_.download_percent = 0;
     snapshot_.video_frames = 0;
+    snapshot_.video_has_audio = false;
+    snapshot_.video_audio_samples = 0;
     snapshot_.message = scan ? "Scanning..." : "Loading...";
     if (scan) {
         snapshot_.title.clear();
@@ -215,6 +217,8 @@ void SdMusicPlayer::Stop() {
     snapshot_.is_video = false;
     snapshot_.download_percent = 0;
     snapshot_.video_frames = 0;
+    snapshot_.video_has_audio = false;
+    snapshot_.video_audio_samples = 0;
     if (worker_) xTaskNotifyGive(worker_);
 }
 
@@ -224,7 +228,8 @@ void SdMusicPlayer::TogglePause() {
     paused_ = !paused_;
     audio_.PauseLocalPlayback(token_, paused_);
     snapshot_.state = paused_ ? State::kPaused : State::kPlaying;
-    snapshot_.message = paused_ ? "Paused" : (snapshot_.is_video ? "Silent video" : "Playing");
+    snapshot_.message = paused_ ? "Paused" :
+        (snapshot_.is_video ? (snapshot_.video_has_audio ? "Video + audio" : "Silent video") : "Playing");
     xTaskNotifyGive(worker_);
 }
 
@@ -473,6 +478,8 @@ SdMusicPlayer::TrackResult SdMusicPlayer::PlayTrack(const Command& command) {
         snapshot_.elapsed_seconds = 0;
         snapshot_.is_video = false;
         snapshot_.video_frames = 0;
+        snapshot_.video_has_audio = false;
+        snapshot_.video_audio_samples = 0;
         video_frame_.reset();
         snapshot_.state = paused_ ? State::kPaused : State::kPlaying;
         snapshot_.message = paused_ ? "Paused" : "Playing";

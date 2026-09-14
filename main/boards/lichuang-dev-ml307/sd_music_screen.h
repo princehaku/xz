@@ -35,6 +35,7 @@ private:
     lv_obj_t* parent_ = nullptr;
     lv_obj_t* video_overlay_ = nullptr;
     lv_obj_t* video_image_ = nullptr;
+    lv_obj_t* video_hint_ = nullptr;
     lv_obj_t* video_toggle_ = nullptr;
     lv_obj_t* help_overlay_ = nullptr;
     lv_image_dsc_t video_dsc_{};

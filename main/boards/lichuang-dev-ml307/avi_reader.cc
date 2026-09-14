@@ -13,11 +13,14 @@ uint32_t Le32(const uint8_t* data) {
            (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
 }
 
+uint16_t Le16(const uint8_t* data) { return data[0] | (static_cast<uint16_t>(data[1]) << 8); }
+
 uint16_t Be16(const uint8_t* data) { return (static_cast<uint16_t>(data[0]) << 8) | data[1]; }
 
 constexpr uint32_t kList = FourCc('L', 'I', 'S', 'T');
 constexpr uint32_t kMjpg = FourCc('M', 'J', 'P', 'G');
 constexpr size_t kMaxJpegBytes = 256 * 1024;
+constexpr size_t kMaxPcmBytes = 256 * 1024;
 // Bound SD reads while callers cannot check cancellation or yield. Open shares
 // one budget across root/header/stream chunks; each NextFrame starts a new one.
 constexpr uint32_t kMaxChunksPerCall = 4096;
@@ -158,7 +161,8 @@ bool AviReader::ParseStream(const Chunk& stream, uint32_t index, bool& selected)
             }
             format_found = true;
             format_size = chunk.size;
-            if (chunk.size >= sizeof(strf) && !Read(chunk.data, strf, sizeof(strf))) {
+            const size_t read_size = chunk.size < sizeof(strf) ? chunk.size : sizeof(strf);
+            if (read_size != 0 && !Read(chunk.data, strf, read_size)) {
                 return false;
             }
         }
@@ -168,7 +172,34 @@ bool AviReader::ParseStream(const Chunk& stream, uint32_t index, bool& selected)
         return false;
     }
     if (Le32(strh) == FourCc('a', 'u', 'd', 's')) {
+        // Select the first audio stream, including when its codec is unsupported.
+        // Video-only traversal remains available for such files.
+        if (info_.has_audio) {
+            return true;
+        }
         info_.has_audio = true;
+        audio_stream_ = index;
+        if (!format_found || format_size < 16) {
+            return true;
+        }
+        info_.audio_channels = Le16(strf + 2);
+        info_.audio_sample_rate = Le32(strf + 4);
+        info_.audio_bits_per_sample = Le16(strf + 14);
+        info_.audio_sample_count = Le32(strh + 32);
+        const uint32_t alignment = info_.audio_channels * 2U;
+        const uint32_t scale = Le32(strh + 20);
+        const uint32_t rate = Le32(strh + 24);
+        info_.audio_supported =
+            Le16(strf) == 1 && (info_.audio_channels == 1 || info_.audio_channels == 2) &&
+            info_.audio_bits_per_sample == 16 && info_.audio_sample_rate >= 8000 &&
+            info_.audio_sample_rate <= 48000 &&
+            (info_.audio_sample_rate % 4000 == 0 || info_.audio_sample_rate % 11025 == 0) &&
+            Le16(strf + 12) == alignment && Le32(strf + 8) == info_.audio_sample_rate * alignment &&
+            (format_size == 16 || (format_size >= 18 && Le16(strf + 16) == 0)) && scale != 0 &&
+            rate == static_cast<uint64_t>(info_.audio_sample_rate) * scale &&
+            Le32(strh + 28) == 0 && Le32(strh + 44) == alignment && info_.audio_sample_count != 0 &&
+            info_.audio_sample_count <= file_size_ / alignment;
+        return true;
     }
     if (selected || Le32(strh) != FourCc('v', 'i', 'd', 's') || Le32(strh + 4) != kMjpg) {
         return true;
@@ -267,9 +298,25 @@ bool AviReader::ValidateJpeg(const std::vector<uint8_t>& jpeg) const {
 }
 
 AviReader::Result AviReader::NextFrame(std::vector<uint8_t>& jpeg) {
-    jpeg.clear();
+    return NextPacket(jpeg, false);
+}
+
+AviReader::Result AviReader::NextAudio(std::vector<uint8_t>& pcm) { return NextPacket(pcm, true); }
+
+AviReader::Result AviReader::NextPacket(std::vector<uint8_t>& data, bool audio) {
+    data.clear();
     if (failed_) {
         return Result::kError;
+    }
+    const uint8_t mode = audio ? 2 : 1;
+    if ((stream_mode_ != 0 && stream_mode_ != mode) ||
+        (audio && info_.has_audio && !info_.audio_supported)) {
+        failed_ = true;
+        return Result::kError;
+    }
+    stream_mode_ = mode;
+    if (audio && !info_.has_audio) {
+        return Result::kEnd;
     }
     remaining_chunks_ = kMaxChunksPerCall;
     while (depth_ != 0) {
@@ -305,23 +352,42 @@ AviReader::Result AviReader::NextFrame(std::vector<uint8_t>& jpeg) {
             FourCc('0' + video_stream_ / 10, '0' + video_stream_ % 10, 'd', 'c');
         const uint32_t video_db =
             FourCc('0' + video_stream_ / 10, '0' + video_stream_ % 10, 'd', 'b');
-        if (chunk.id != video_dc && chunk.id != video_db) {
+        const uint32_t audio_wb =
+            FourCc('0' + audio_stream_ / 10, '0' + audio_stream_ % 10, 'w', 'b');
+        if (audio ? chunk.id != audio_wb : (chunk.id != video_dc && chunk.id != video_db)) {
             continue;
+        }
+        if (audio) {
+            const uint32_t alignment = info_.audio_channels * 2U;
+            if (chunk.size == 0 || chunk.size > kMaxPcmBytes || chunk.size % alignment != 0 ||
+                chunk.size / alignment > info_.audio_sample_count - audio_samples_read_) {
+                failed_ = true;
+                return Result::kError;
+            }
+            data.resize(chunk.size);
+            if (!Read(chunk.data, data.data(), data.size())) {
+                data.clear();
+                failed_ = true;
+                return Result::kError;
+            }
+            audio_samples_read_ += chunk.size / alignment;
+            return Result::kAudio;
         }
         if (chunk.size == 0 || chunk.size > kMaxJpegBytes || frames_read_ >= info_.frame_count) {
             failed_ = true;
             return Result::kError;
         }
-        jpeg.resize(chunk.size);
-        if (!Read(chunk.data, jpeg.data(), jpeg.size()) || !ValidateJpeg(jpeg)) {
-            jpeg.clear();
+        data.resize(chunk.size);
+        if (!Read(chunk.data, data.data(), data.size()) || !ValidateJpeg(data)) {
+            data.clear();
             failed_ = true;
             return Result::kError;
         }
         ++frames_read_;
         return Result::kFrame;
     }
-    if (frames_read_ != info_.frame_count) {
+    if (audio ? audio_samples_read_ != info_.audio_sample_count
+              : frames_read_ != info_.frame_count) {
         failed_ = true;
         return Result::kError;
     }

@@ -30,7 +30,7 @@ progress{width:100%}.hint{color:#555;font-size:14px}
 </style></head><body>
 <h1>SD 卡视频</h1>
 <p>通过 Wi-Fi 下载 AVI 到板上的 SD 卡，文件保存在 video 目录。</p>
-<p class="hint">首版支持 MJPEG 编码的 AVI，最大 320 × 240，播放无声。视频地址需能被开发板直接访问。</p>
+<p class="hint">支持 MJPEG 编码的 AVI，最大 320 × 240；音轨支持 16 位 PCM，单声道或双声道，8–48 kHz。视频地址需能被开发板直接访问。</p>
 <form id="download-form"><label for="url">HTTP / HTTPS 视频地址</label>
 <input id="url" type="url" maxlength="1024" required placeholder="http://192.168.1.2:8000/test.avi" autocomplete="off">
 <button type="submit">下载到 SD 卡</button></form>
@@ -72,7 +72,9 @@ async function updateStatus() {
     statusText.textContent = '状态：' + (data.state ?? '未知') + '\n文件：' + (data.title || '—')
       + '\n提示：' + (data.message || '—') + '\n下载进度：' + percent + '%'
       + '\n视频：' + (data.is_video ? '是' : '否')
-      + '\n视频帧数：' + (data.frame_count ?? data.video_frames ?? 0);
+      + '\n视频帧数：' + (data.frame_count ?? data.video_frames ?? 0)
+      + '\n音轨：' + (data.is_video ? (data.has_audio ? 'PCM' : '无音轨') : '—')
+      + '\n已提交音频采样：' + (data.audio_samples ?? 0);
   } catch (error) { statusText.textContent = '读取失败：' + error.message; }
   setTimeout(updateStatus, 1000);
 }

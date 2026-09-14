@@ -78,12 +78,14 @@ struct AudioService {
     bool PushLocalPcm(uint32_t, std::vector<int16_t>&);
     void PauseLocalPlayback(uint32_t, bool);
     void EndLocalPlayback(uint32_t);
+    uint64_t GetLocalPlaybackSamples(uint32_t);
     void EnableWakeWordDetection(bool);
     void EnableAudioTesting(bool);
     void SetModelsList(srmodel_list_t*);
     void Stop();
 ''', 1)
 head = head.replace("void EnableVoiceProcessing(bool p) { processing = p; }", "void EnableVoiceProcessing(bool);")
+head = head.replace("void EnableWakeWordDetection(bool) {}", "")
 head = head.replace("void PlaySound(const char*) {}", "void PlaySound(const std::string_view&);")
 head = head.replace("std::function<void()> on_send_queue_available;", "std::function<void()> on_send_queue_available; std::function<void(const std::string&)> on_wake_word_detected;")
 audio_header = (repo / "main/audio/audio_service.h").read_text(encoding="utf-8")
@@ -146,6 +148,7 @@ int main() {
     {
         AudioService a; auto token=a.BeginLocalPlayback(); fill(a,token);
         a.PauseLocalPlayback(token,true); a.ResetDecoder();
+        assert(a.GetLocalPlaybackSamples(token)==0 && a.GetLocalPlaybackSamples(0)==0);
         assert(a.audio_playback_queue_.size()==MAX_PLAYBACK_TASKS_IN_QUEUE && !a.IsPlaybackComplete());
         std::thread worker([&]{a.AudioOutputTask();});
         std::vector<int16_t> p(320,9); auto start=std::chrono::steady_clock::now();
@@ -154,10 +157,51 @@ int main() {
         { std::lock_guard<std::mutex> lock(a.fake_codec.writes_mutex); assert(a.fake_codec.writes.empty()); }
         a.PauseLocalPlayback(token,false); assert(a.PushLocalPcm(token,p) && p.empty());
         wait_empty(a); assert(!a.IsPlaybackComplete());
+        assert(a.GetLocalPlaybackSamples(token)==9*320);
         { std::lock_guard<std::mutex> lock(a.audio_queue_mutex_); a.last_output_time_=std::chrono::steady_clock::now()-201ms; }
         assert(a.IsPlaybackComplete()); stop_worker(a,worker);
         assert((a.fake_codec.writes==std::vector<int16_t>{1,2,3,4,5,6,7,8,9}));
         std::cout << "PASS pause keeps queued PCM, bounded wait preserves data, resume order and DMA tail\n";
+    }
+    {
+        AudioService a; auto token=a.BeginLocalPlayback(); Gate output;
+        a.fake_codec.output_hook=[&]{output.Wait();};
+        std::vector<int16_t> first(160,11), second(320,12);
+        assert(a.PushLocalPcm(token,first) && a.PushLocalPcm(token,second));
+        std::thread worker([&]{a.AudioOutputTask();}); output.Arrived();
+        // Enqueued and in-flight samples are not counted before OutputData returns.
+        assert(a.GetLocalPlaybackSamples(token)==0);
+        auto pause=std::async(std::launch::async,[&]{a.PauseLocalPlayback(token,true);});
+        assert(pause.wait_for(20ms)==std::future_status::timeout);
+        output.release.set_value(); pause.get();
+        assert(a.GetLocalPlaybackSamples(token)==160);
+        std::this_thread::sleep_for(20ms);
+        assert(a.GetLocalPlaybackSamples(token)==160);
+        a.fake_codec.output_hook={}; a.PauseLocalPlayback(token,false);
+        wait_empty(a); assert(a.GetLocalPlaybackSamples(token)==480);
+        a.EndLocalPlayback(token); assert(a.GetLocalPlaybackSamples(token)==0);
+        stop_worker(a,worker);
+        std::cout << "PASS submitted sample progress follows codec completion and freezes after pause barrier\n";
+    }
+    {
+        AudioService a; auto old=a.BeginLocalPlayback(); Gate output;
+        a.fake_codec.output_hook=[&]{output.Wait();};
+        std::vector<int16_t> first(320,21); assert(a.PushLocalPcm(old,first));
+        std::thread worker([&]{a.AudioOutputTask();}); output.Arrived();
+        auto begin=std::async(std::launch::async,[&]{return a.BeginLocalPlayback();});
+        assert(begin.wait_for(20ms)==std::future_status::timeout);
+        auto reserved=a.local_playback_token_.load(); assert(reserved && reserved!=old);
+        assert(a.GetLocalPlaybackSamples(old)==0 && a.GetLocalPlaybackSamples(reserved)==0);
+        output.release.set_value(); auto current=begin.get();
+        assert(current==reserved && a.GetLocalPlaybackSamples(current)==0);
+        a.fake_codec.output_hook={};
+        std::vector<int16_t> next(160,22); assert(a.PushLocalPcm(current,next));
+        wait_empty(a);
+        assert(a.GetLocalPlaybackSamples(current)==160 && a.GetLocalPlaybackSamples(old)==0);
+        auto replacement=a.BeginLocalPlayback();
+        assert(a.GetLocalPlaybackSamples(replacement)==0 && a.GetLocalPlaybackSamples(current)==0);
+        stop_worker(a,worker);
+        std::cout << "PASS replacement resets submitted samples and rejects old in-flight writes and token reads\n";
     }
     {
         AudioService a; auto old=a.BeginLocalPlayback(); fill(a,old);
@@ -185,7 +229,7 @@ int main() {
         // Reservation and queue invalidation happen before waiting for the old hardware write.
         assert(a.IsLocalPlaybackActive());
         output.release.set_value(); auto token=begin.get();
-        a.fake_codec.output_hook={};
+        a.fake_codec.output_hook={}; assert(a.GetLocalPlaybackSamples(token)==0);
         std::vector<int16_t> p(320,3); assert(a.PushLocalPcm(token,p));
         wait_empty(a); stop_worker(a,worker);
         assert((a.fake_codec.writes==std::vector<int16_t>{1,3}));
@@ -224,7 +268,7 @@ int main() {
 '''
 
 parts = [head]
-for name in ["BeginLocalPlayback", "PushLocalPcm", "PauseLocalPlayback", "EndLocalPlayback", "Stop",
+for name in ["BeginLocalPlayback", "PushLocalPcm", "PauseLocalPlayback", "EndLocalPlayback", "GetLocalPlaybackSamples", "Stop",
              "ResetDecoder", "ResetEncoder", "IsPlaybackComplete", "OpusCodecTask", "AudioOutputTask",
              "PushPacketToDecodeQueue", "EnqueueDecodePacket", "EnableWakeWordDetection",
              "EnableVoiceProcessing", "EnableAudioTesting", "SetModelsList", "PlaySound"]:

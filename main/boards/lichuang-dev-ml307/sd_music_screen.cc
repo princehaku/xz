@@ -90,11 +90,11 @@ SdMusicScreen::SdMusicScreen(lv_obj_t* parent, SdMusicPlayer& player, Actions ac
     lv_obj_add_flag(video_overlay_, LV_OBJ_FLAG_HIDDEN);
     video_image_ = lv_image_create(video_overlay_);
     lv_obj_center(video_image_);
-    auto* video_hint = lv_label_create(video_overlay_);
-    lv_label_set_text(video_hint, "AVI / silent");
-    lv_obj_set_pos(video_hint, 6, 4);
-    lv_obj_set_style_bg_color(video_hint, lv_color_black(), 0);
-    lv_obj_set_style_bg_opa(video_hint, LV_OPA_70, 0);
+    video_hint_ = lv_label_create(video_overlay_);
+    lv_label_set_text(video_hint_, "AVI / silent");
+    lv_obj_set_pos(video_hint_, 6, 4);
+    lv_obj_set_style_bg_color(video_hint_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(video_hint_, LV_OPA_70, 0);
     Button(video_overlay_, 4, 202, 64, 34, "Back", [](lv_event_t* e) { Self(e)->actions_.back(); });
     Button(video_overlay_, 72, 202, 76, 34, "Previous", [](lv_event_t* e) { Self(e)->actions_.previous(); });
     video_toggle_ = Button(video_overlay_, 152, 202, 76, 34, "Pause", [](lv_event_t* e) { Self(e)->actions_.toggle(); });
@@ -132,7 +132,7 @@ void SdMusicScreen::ShowDownloadHelp() {
     const auto address = actions_.portal_address ? actions_.portal_address() : std::string();
     const std::string text = address.empty()
         ? "Connect to Wi-Fi first.\nThen open this page on your phone."
-        : "Open on a phone or PC\non the same Wi-Fi:\n" + address + "\n\nEnter the AVI download URL.\nMJPEG, up to 320 x 240.\nVideo plays without sound.";
+        : "Open on a phone or PC\non the same Wi-Fi:\n" + address + "\n\nEnter the AVI download URL.\nMJPEG, up to 320 x 240.\nAudio: 16-bit PCM, 8-48 kHz.";
     auto* label = lv_label_create(help_overlay_);
     lv_obj_set_pos(label, 16, 52);
     lv_obj_set_width(label, 288);
@@ -171,6 +171,10 @@ void SdMusicScreen::UpdateVideo(const SdMusicPlayer::Snapshot& snapshot) {
     }
     lv_label_set_text(lv_obj_get_child(video_toggle_, 0),
         snapshot.state == SdMusicPlayer::State::kPaused ? "Play" : "Pause");
+    if (lv_obj_has_flag(video_overlay_, LV_OBJ_FLAG_HIDDEN) ||
+        snapshot.video_has_audio != last_.video_has_audio) {
+        lv_label_set_text(video_hint_, snapshot.video_has_audio ? "AVI / PCM audio" : "AVI / silent");
+    }
     lv_obj_remove_flag(video_overlay_, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -211,7 +215,10 @@ void SdMusicScreen::Update(bool force) {
             case State::kPaused: text = "已暂停"; fallback = "Paused"; break;
             case State::kNoCard: text = "请插入 SD 卡后点重扫"; fallback = "Insert SD card, then Rescan"; break;
             case State::kEmpty: text = "请放入音乐或下载 AVI 视频"; fallback = "Add music or download an AVI"; break;
-            case State::kError: text = "操作失败，请检查文件或网络"; fallback = snapshot.message.c_str(); break;
+            case State::kError:
+                text = snapshot.message.empty() ? "播放或下载失败" : snapshot.message.c_str();
+                fallback = snapshot.message.empty() ? "Playback or download failed" : snapshot.message.c_str();
+                break;
             case State::kStopped: break;
         }
         SetText(status_, text, fallback);
