@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -16,7 +17,7 @@ class AudioService;
 
 class SdMusicPlayer {
 public:
-    enum class State { kStopped, kScanning, kPlaying, kPaused, kNoCard, kEmpty, kError };
+    enum class State { kStopped, kScanning, kPlaying, kPaused, kNoCard, kEmpty, kError, kDownloading };
     struct Snapshot {
         State state = State::kStopped;
         std::string title;
@@ -24,6 +25,15 @@ public:
         size_t total = 0;
         uint32_t elapsed_seconds = 0;
         std::string message;
+        bool is_video = false;
+        int download_percent = 0;
+        uint32_t video_frames = 0;
+    };
+    struct VideoFrame {
+        std::vector<uint8_t> pixels;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t stride = 0;
     };
 
     explicit SdMusicPlayer(AudioService& audio);
@@ -40,6 +50,8 @@ public:
     void Previous();
     void Rescan();
     Snapshot GetSnapshot() const;
+    std::shared_ptr<const VideoFrame> GetVideoFrame() const;
+    bool DownloadVideo(const std::string& url);
 
 private:
     enum class TrackResult { kComplete, kBadFile, kCancelled, kAudioError };
@@ -49,6 +61,7 @@ private:
         size_t index;
         bool running;
         bool scan;
+        std::string download_url = {};
     };
     AudioService& audio_;
     mutable std::mutex mutex_;
@@ -62,6 +75,8 @@ private:
     uint32_t token_ = 0;
     size_t selected_index_ = 0;
     Snapshot snapshot_;
+    std::string download_url_;
+    std::shared_ptr<const VideoFrame> video_frame_;
 
     // Accessed only by Worker().
     sdmmc_card_t* card_ = nullptr;
@@ -75,10 +90,12 @@ private:
     bool WaitUntilPlaying(uint32_t generation);
     void SetState(uint32_t generation, State state, const char* message);
     void Worker();
-    bool MountAndScan(uint32_t generation);
+    bool MountAndScan(uint32_t generation, bool allow_empty = false);
     void ScanDirectory(const std::string& directory, unsigned depth, size_t& visited,
                        uint32_t generation, std::vector<std::string>& found);
     void Unmount();
     TrackResult PlayTrack(const Command& command);
+    TrackResult PlayVideoTrack(const Command& command);
+    bool DownloadVideoFile(const Command& command);
     bool Advance(const Command& command, bool failed);
 };

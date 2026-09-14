@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <utility>
 #include <src/misc/lv_text_private.h>
+#include <src/misc/cache/instance/lv_image_cache.h>
 
 namespace {
 bool SupportsText(const lv_font_t* font, const char* text) {
@@ -41,16 +42,14 @@ lv_obj_t* SdMusicScreen::Button(lv_obj_t* parent, int x, int y, int w, int h,
 }
 
 SdMusicScreen::SdMusicScreen(lv_obj_t* parent, SdMusicPlayer& player, Actions actions)
-    : player_(player), actions_(std::move(actions)) {
+    : player_(player), actions_(std::move(actions)), parent_(parent) {
     lv_obj_set_style_bg_color(parent, lv_color_hex(0x101722), 0);
     lv_obj_set_style_text_color(parent, lv_color_hex(0xF3F5F7), 0);
     lv_obj_set_style_text_font(parent, &lv_font_montserrat_14, 0);
 
     back_ = Button(parent, 8, 6, 64, 32, "Back", [](lv_event_t* e) { Self(e)->actions_.back(); });
     rescan_ = Button(parent, 248, 6, 64, 32, "Rescan", [](lv_event_t* e) { Self(e)->actions_.rescan(); });
-    auto* heading = lv_label_create(parent);
-    lv_label_set_text(heading, "SD Music");
-    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 14);
+    Button(parent, 80, 6, 160, 32, "Download AVI", [](lv_event_t* e) { Self(e)->ShowDownloadHelp(); });
 
     title_ = lv_label_create(parent);
     lv_obj_set_pos(title_, 16, 47);
@@ -61,6 +60,7 @@ SdMusicScreen::SdMusicScreen(lv_obj_t* parent, SdMusicPlayer& player, Actions ac
     status_ = lv_label_create(parent);
     lv_obj_set_pos(status_, 16, 76);
     lv_obj_set_width(status_, 288);
+    lv_label_set_long_mode(status_, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(status_, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(status_, lv_color_hex(0x9DB1C9), 0);
 
@@ -81,15 +81,97 @@ SdMusicScreen::SdMusicScreen(lv_obj_t* parent, SdMusicPlayer& player, Actions ac
     lv_obj_set_width(volume_, 192);
     lv_obj_set_style_text_align(volume_, LV_TEXT_ALIGN_CENTER, 0);
 
+    video_overlay_ = lv_obj_create(parent);
+    lv_obj_remove_style_all(video_overlay_);
+    lv_obj_set_size(video_overlay_, 320, 240);
+    lv_obj_set_style_bg_color(video_overlay_, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(video_overlay_, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(video_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(video_overlay_, LV_OBJ_FLAG_HIDDEN);
+    video_image_ = lv_image_create(video_overlay_);
+    lv_obj_center(video_image_);
+    auto* video_hint = lv_label_create(video_overlay_);
+    lv_label_set_text(video_hint, "AVI / silent");
+    lv_obj_set_pos(video_hint, 6, 4);
+    lv_obj_set_style_bg_color(video_hint, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(video_hint, LV_OPA_70, 0);
+    Button(video_overlay_, 4, 202, 64, 34, "Back", [](lv_event_t* e) { Self(e)->actions_.back(); });
+    Button(video_overlay_, 72, 202, 76, 34, "Previous", [](lv_event_t* e) { Self(e)->actions_.previous(); });
+    video_toggle_ = Button(video_overlay_, 152, 202, 76, 34, "Pause", [](lv_event_t* e) { Self(e)->actions_.toggle(); });
+    Button(video_overlay_, 232, 202, 84, 34, "Next", [](lv_event_t* e) { Self(e)->actions_.next(); });
+
     timer_ = lv_timer_create([](lv_timer_t* timer) {
         static_cast<SdMusicScreen*>(lv_timer_get_user_data(timer))->Update();
-    }, 250, this);
+    }, 33, this);
     Update(true);
 }
 
 SdMusicScreen::~SdMusicScreen() {
     if (timer_) lv_timer_delete(timer_);
+    lv_image_cache_drop(&video_dsc_);
     // The owning board deletes the label tree before this object's font owner.
+}
+
+void SdMusicScreen::ShowDownloadHelp() {
+    if (help_overlay_) return;
+    help_overlay_ = lv_obj_create(parent_);
+    lv_obj_remove_style_all(help_overlay_);
+    lv_obj_set_size(help_overlay_, 320, 240);
+    lv_obj_set_style_bg_color(help_overlay_, lv_color_hex(0x101722), 0);
+    lv_obj_set_style_bg_opa(help_overlay_, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(help_overlay_, LV_OBJ_FLAG_SCROLLABLE);
+    auto* title = lv_label_create(help_overlay_);
+    lv_label_set_text(title, "Download AVI");
+    lv_obj_set_pos(title, 16, 17);
+    Button(help_overlay_, 224, 6, 88, 32, "Close", [](lv_event_t* e) {
+        auto* self = Self(e);
+        auto* overlay = self->help_overlay_;
+        self->help_overlay_ = nullptr;
+        lv_obj_delete(overlay);
+    });
+    const auto address = actions_.portal_address ? actions_.portal_address() : std::string();
+    const std::string text = address.empty()
+        ? "Connect to Wi-Fi first.\nThen open this page on your phone."
+        : "Open on a phone or PC\non the same Wi-Fi:\n" + address + "\n\nEnter the AVI download URL.\nMJPEG, up to 320 x 240.\nVideo plays without sound.";
+    auto* label = lv_label_create(help_overlay_);
+    lv_obj_set_pos(label, 16, 52);
+    lv_obj_set_width(label, 288);
+    lv_label_set_text(label, text.c_str());
+}
+
+void SdMusicScreen::UpdateVideo(const SdMusicPlayer::Snapshot& snapshot) {
+    auto frame = player_.GetVideoFrame();
+    const bool show = snapshot.is_video && frame &&
+        (snapshot.state == SdMusicPlayer::State::kPlaying || snapshot.state == SdMusicPlayer::State::kPaused);
+    if (!show) {
+        lv_obj_add_flag(video_overlay_, LV_OBJ_FLAG_HIDDEN);
+        if (video_frame_) {
+            lv_image_set_src(video_image_, nullptr);
+            lv_image_cache_drop(&video_dsc_);
+            video_frame_.reset();
+        }
+        return;
+    }
+    if (frame != video_frame_) {
+        lv_image_cache_drop(&video_dsc_);
+        // Keep the old pixels alive until LVGL has switched to the next descriptor.
+        auto previous = std::move(video_frame_);
+        video_frame_ = std::move(frame);
+        video_dsc_ = {};
+        video_dsc_.header.magic = LV_IMAGE_HEADER_MAGIC;
+        video_dsc_.header.cf = LV_COLOR_FORMAT_RGB565;
+        video_dsc_.header.w = video_frame_->width;
+        video_dsc_.header.h = video_frame_->height;
+        video_dsc_.header.stride = video_frame_->stride;
+        video_dsc_.data_size = video_frame_->pixels.size();
+        video_dsc_.data = video_frame_->pixels.data();
+        lv_image_set_src(video_image_, &video_dsc_);
+        lv_obj_center(video_image_);
+        lv_obj_invalidate(video_image_);
+    }
+    lv_label_set_text(lv_obj_get_child(video_toggle_, 0),
+        snapshot.state == SdMusicPlayer::State::kPaused ? "Play" : "Pause");
+    lv_obj_remove_flag(video_overlay_, LV_OBJ_FLAG_HIDDEN);
 }
 
 void SdMusicScreen::SetFont(std::shared_ptr<LvglFont> font) {
@@ -110,26 +192,34 @@ void SdMusicScreen::Update(bool force) {
     const auto snapshot = player_.GetSnapshot();
     const int volume = actions_.get_volume();
     force = force || !initialized_;
+    UpdateVideo(snapshot);
     if (force || snapshot.title != last_.title || snapshot.index != last_.index) {
         char fallback[32];
         snprintf(fallback, sizeof(fallback), "Track %u", static_cast<unsigned>(snapshot.index + 1));
         SetText(title_, snapshot.title.empty() ? "SD 卡音乐" : snapshot.title.c_str(),
-                snapshot.title.empty() ? "MP3 / PCM WAV" : fallback);
+                snapshot.title.empty() ? "MP3 / PCM WAV / MJPEG AVI" : fallback);
     }
-    if (force || snapshot.state != last_.state || snapshot.message != last_.message) {
+    if (force || snapshot.state != last_.state || snapshot.message != last_.message ||
+        snapshot.download_percent != last_.download_percent) {
         using State = SdMusicPlayer::State;
         const char* text = "正在准备";
         const char* fallback = "Preparing...";
         switch (snapshot.state) {
             case State::kScanning: text = "正在读取 SD 卡"; fallback = "Reading SD card..."; break;
+            case State::kDownloading: text = "正在下载视频到 SD 卡"; fallback = "Downloading AVI to SD..."; break;
             case State::kPlaying: text = "播放中"; fallback = "Playing"; break;
             case State::kPaused: text = "已暂停"; fallback = "Paused"; break;
             case State::kNoCard: text = "请插入 SD 卡后点重扫"; fallback = "Insert SD card, then Rescan"; break;
-            case State::kEmpty: text = "请在 music 中放入音乐"; fallback = "Add MP3/WAV to /music, then Rescan"; break;
-            case State::kError: text = "读取失败，请检查音乐文件"; fallback = "Cannot play. Check files / Rescan"; break;
+            case State::kEmpty: text = "请放入音乐或下载 AVI 视频"; fallback = "Add music or download an AVI"; break;
+            case State::kError: text = "操作失败，请检查文件或网络"; fallback = snapshot.message.c_str(); break;
             case State::kStopped: break;
         }
         SetText(status_, text, fallback);
+        if (snapshot.state == State::kDownloading) {
+            char progress[48];
+            snprintf(progress, sizeof(progress), "Downloading AVI... %d%%", snapshot.download_percent);
+            lv_label_set_text(status_, progress);
+        }
         SetText(lv_obj_get_child(toggle_, 0), snapshot.state == State::kPlaying ? "暂停" : "播放",
                 snapshot.state == State::kPlaying ? "Pause" : "Play");
         const bool playable = snapshot.state == State::kPlaying || snapshot.state == State::kPaused;

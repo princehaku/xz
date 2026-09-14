@@ -163,7 +163,7 @@ bool SdMusicPlayer::EnsureWorkerLocked() {
     if (worker_) return true;
     if (xTaskCreate([](void* context) {
             static_cast<SdMusicPlayer*>(context)->Worker();
-        }, "sd_music", 8192, this, 3, &worker_) != pdPASS) {
+        }, "sd_music", 12288, this, 3, &worker_) != pdPASS) {
         worker_ = nullptr;
         snapshot_.state = State::kError;
         snapshot_.message = "Player unavailable";
@@ -174,12 +174,17 @@ bool SdMusicPlayer::EnsureWorkerLocked() {
 
 void SdMusicPlayer::RestartLocked(bool scan) {
     ++generation_;
+    download_url_.clear();
+    video_frame_.reset();
     if (token_) audio_.EndLocalPlayback(token_);
     token_ = audio_.BeginLocalPlayback();
     paused_ = false;
     scan_requested_ = scan_requested_ || scan;
     snapshot_.state = scan ? State::kScanning : State::kPlaying;
     snapshot_.elapsed_seconds = 0;
+    snapshot_.is_video = false;
+    snapshot_.download_percent = 0;
+    snapshot_.video_frames = 0;
     snapshot_.message = scan ? "Scanning..." : "Loading...";
     if (scan) {
         snapshot_.title.clear();
@@ -201,10 +206,15 @@ void SdMusicPlayer::Stop() {
     running_ = false;
     paused_ = false;
     scan_requested_ = false;
+    download_url_.clear();
+    video_frame_.reset();
     if (token_) audio_.EndLocalPlayback(token_);
     token_ = 0;
     snapshot_.state = State::kStopped;
     snapshot_.message.clear();
+    snapshot_.is_video = false;
+    snapshot_.download_percent = 0;
+    snapshot_.video_frames = 0;
     if (worker_) xTaskNotifyGive(worker_);
 }
 
@@ -214,12 +224,16 @@ void SdMusicPlayer::TogglePause() {
     paused_ = !paused_;
     audio_.PauseLocalPlayback(token_, paused_);
     snapshot_.state = paused_ ? State::kPaused : State::kPlaying;
-    snapshot_.message = paused_ ? "Paused" : "Playing";
+    snapshot_.message = paused_ ? "Paused" : (snapshot_.is_video ? "Silent video" : "Playing");
     xTaskNotifyGive(worker_);
 }
 
 void SdMusicPlayer::ChangeTrack(int direction) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (running_ && snapshot_.state == State::kDownloading && !snapshot_.total) {
+        RestartLocked(true);
+        return;
+    }
     if (!running_ || !snapshot_.total || snapshot_.state == State::kScanning) return;
     selected_index_ = (selected_index_ + snapshot_.total + direction) % snapshot_.total;
     RestartLocked(false);
@@ -291,15 +305,17 @@ void SdMusicPlayer::ScanDirectory(const std::string& directory, unsigned depth, 
         if (S_ISDIR(info.st_mode)) {
             auto lower = name;
             for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (depth > 0 || lower == "music") ScanDirectory(path, depth + 1, visited, generation, found);
+            if (depth > 0 || lower == "music" || lower == "video") {
+                ScanDirectory(path, depth + 1, visited, generation, found);
+            }
         } else if (S_ISREG(info.st_mode) && info.st_size > 0) {
             const auto extension = Extension(name);
-            if (extension == ".mp3" || extension == ".wav") found.push_back(path);
+            if (extension == ".mp3" || extension == ".wav" || extension == ".avi") found.push_back(path);
         }
     }
 }
 
-bool SdMusicPlayer::MountAndScan(uint32_t generation) {
+bool SdMusicPlayer::MountAndScan(uint32_t generation, bool allow_empty) {
     Unmount();
     if (!IsCurrent(generation)) return false;
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
@@ -334,8 +350,9 @@ bool SdMusicPlayer::MountAndScan(uint32_t generation) {
     if (!IsCurrent(generation) || !running_) return false;
     snapshot_.total = tracks_.size();
     if (tracks_.empty()) {
+        if (allow_empty) return true;
         snapshot_.state = State::kEmpty;
-        snapshot_.message = "No MP3 or PCM WAV files";
+        snapshot_.message = "No MP3, WAV or MJPEG AVI files";
         return false;
     }
     selected_index_ %= tracks_.size();
@@ -350,7 +367,8 @@ bool SdMusicPlayer::Advance(const Command& command, bool failed) {
     else consecutive_failures_ = 0;
     if (consecutive_failures_ >= tracks_.size()) {
         snapshot_.state = State::kError;
-        snapshot_.message = "No playable audio files";
+        snapshot_.message = "No playable media files";
+        video_frame_.reset();
         return false;
     }
     selected_index_ = (command.index + 1) % tracks_.size();
@@ -365,8 +383,11 @@ void SdMusicPlayer::Worker() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (shutdown_) break;
-            command = {generation_.load(), token_, selected_index_, running_, scan_requested_};
-            if (command.generation != handled) scan_requested_ = false;
+            command = {generation_.load(), token_, selected_index_, running_, scan_requested_, download_url_};
+            if (command.generation != handled) {
+                scan_requested_ = false;
+                download_url_.clear();
+            }
         }
         if (command.generation == handled) {
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -378,6 +399,24 @@ void SdMusicPlayer::Worker() {
             continue;
         }
         try {
+            if (!command.download_url.empty()) {
+                consecutive_failures_ = 0;
+                if (!MountAndScan(command.generation, true) || !DownloadVideoFile(command)) continue;
+                if (!MountAndScan(command.generation, true)) continue;
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!IsCurrent(command.generation)) continue;
+                const std::string downloaded = "/sdcard/video/test.avi";
+                auto found = std::find(tracks_.begin(), tracks_.end(), downloaded);
+                if (found == tracks_.end()) {
+                    if (tracks_.size() >= kMaxTracks) tracks_.pop_back();
+                    tracks_.push_back(downloaded);
+                    found = tracks_.end() - 1;
+                }
+                selected_index_ = static_cast<size_t>(found - tracks_.begin());
+                snapshot_.total = tracks_.size();
+                command.index = selected_index_;
+                command.scan = false;
+            }
             if (command.scan) {
                 consecutive_failures_ = 0;
                 if (!MountAndScan(command.generation)) continue;
@@ -408,7 +447,9 @@ void SdMusicPlayer::Worker() {
 
 SdMusicPlayer::TrackResult SdMusicPlayer::PlayTrack(const Command& command) {
     if (!IsCurrent(command.generation)) return TrackResult::kCancelled;
-    if (command.index >= tracks_.size() || !RegisterDecoders()) return TrackResult::kBadFile;
+    if (command.index >= tracks_.size()) return TrackResult::kBadFile;
+    if (Extension(tracks_[command.index]) == ".avi") return PlayVideoTrack(command);
+    if (!RegisterDecoders()) return TrackResult::kBadFile;
     TrackResources resources;
     resources.file.reset(fopen(tracks_[command.index].c_str(), "rb"));
     if (!resources.file) return TrackResult::kBadFile;
@@ -430,6 +471,9 @@ SdMusicPlayer::TrackResult SdMusicPlayer::PlayTrack(const Command& command) {
         snapshot_.index = command.index;
         snapshot_.title = TrackTitle(tracks_[command.index]);
         snapshot_.elapsed_seconds = 0;
+        snapshot_.is_video = false;
+        snapshot_.video_frames = 0;
+        video_frame_.reset();
         snapshot_.state = paused_ ? State::kPaused : State::kPlaying;
         snapshot_.message = paused_ ? "Paused" : "Playing";
     }

@@ -14,6 +14,8 @@
 #include "lvgl_theme.h"
 #include "sd_music_player.h"
 #include "sd_music_screen.h"
+#include "sd_video_portal.h"
+#include "sd_video_url.h"
 
 #include <algorithm>
 #include <atomic>
@@ -140,6 +142,7 @@ private:
     std::string photo_hint_fallback_;
     std::unique_ptr<SdMusicPlayer> music_player_;
     std::unique_ptr<SdMusicScreen> music_screen_;
+    std::unique_ptr<SdVideoPortal> video_portal_;
     std::atomic<bool> preview_running_{false};
     std::atomic<uint32_t> preview_generation_{0};
     int preview_fail_count_ = 0;
@@ -252,7 +255,7 @@ private:
         self->EnterMusic();
     }
 
-    void EnterMusic() {
+    void EnterMusic(const std::string& download_url = std::string()) {
         if (!lvgl_port_lock(500)) return;
         StopPreview();
         DeleteOverlayLocked();
@@ -266,9 +269,10 @@ private:
             state == kDeviceStateListening || state == kDeviceStateSpeaking) app.EndConversation();
         else app.SetKeepAlive(false);
         // Start only after queued conversation cleanup, including decoder reset.
-        app.Schedule([this, generation]() {
+        app.Schedule([this, generation, download_url]() {
             if (page_generation_ == generation && app_mode_ == AppMode::kMusic) {
-                music_player_->Start();
+                if (download_url.empty()) music_player_->Start();
+                else music_player_->DownloadVideo(download_url);
             }
         });
     }
@@ -328,6 +332,10 @@ private:
             });
         };
         actions.get_volume = [this]() { return GetAudioCodec()->output_volume(); };
+        actions.portal_address = [this]() {
+            if (!wifi_ready_) return std::string();
+            return "http://" + WifiManager::GetInstance().GetIpAddress() + ":8080/";
+        };
         music_screen_ = std::make_unique<SdMusicScreen>(home_overlay_, *music_player_, std::move(actions));
         auto* lcd = dynamic_cast<BoardLcdDisplay*>(display_);
         if (lcd) music_screen_->SetFont(lcd->AppliedTextFont());
@@ -1005,8 +1013,81 @@ private:
 #endif
     }
 
+    std::string VideoStatus() {
+        const auto snapshot = music_player_->GetSnapshot();
+        const char* state = "stopped";
+        switch (snapshot.state) {
+            case SdMusicPlayer::State::kScanning: state = "scanning"; break;
+            case SdMusicPlayer::State::kDownloading: state = "downloading"; break;
+            case SdMusicPlayer::State::kPlaying: state = "playing"; break;
+            case SdMusicPlayer::State::kPaused: state = "paused"; break;
+            case SdMusicPlayer::State::kNoCard: state = "no_card"; break;
+            case SdMusicPlayer::State::kEmpty: state = "empty"; break;
+            case SdMusicPlayer::State::kError: state = "error"; break;
+            case SdMusicPlayer::State::kStopped: break;
+        }
+        auto* json = cJSON_CreateObject();
+        if (!json) return "{}";
+        cJSON_AddStringToObject(json, "state", state);
+        cJSON_AddStringToObject(json, "title", snapshot.title.c_str());
+        cJSON_AddStringToObject(json, "message", snapshot.message.c_str());
+        cJSON_AddBoolToObject(json, "is_video", snapshot.is_video);
+        cJSON_AddNumberToObject(json, "download_percent", snapshot.download_percent);
+        cJSON_AddNumberToObject(json, "video_frames", snapshot.video_frames);
+        cJSON_AddNumberToObject(json, "elapsed_seconds", snapshot.elapsed_seconds);
+        auto* encoded = cJSON_PrintUnformatted(json);
+        std::string result = encoded ? encoded : "{}";
+        cJSON_free(encoded);
+        cJSON_Delete(json);
+        return result;
+    }
+
+    void InitializeVideoPortal() {
+        SdVideoPortal::Actions actions;
+        actions.download = [this](const std::string& url) {
+            Application::GetInstance().Schedule([this, url]() { EnterMusic(url); });
+        };
+        actions.control = [this](const std::string& action) {
+            Application::GetInstance().Schedule([this, action]() {
+                if (action == "stop") ReturnHome();
+                else if (action == "play") EnterMusic();
+                else if (app_mode_ == AppMode::kMusic && action == "pause") music_player_->TogglePause();
+                else if (action == "rescan") {
+                    if (app_mode_ == AppMode::kMusic) music_player_->Rescan();
+                    else EnterMusic();
+                }
+            });
+        };
+        actions.status = [this]() { return VideoStatus(); };
+        video_portal_ = std::make_unique<SdVideoPortal>(std::move(actions));
+    }
+
+    void UpdateVideoPortal() {
+        if (!video_portal_) return;
+        if (wifi_ready_) {
+            if (video_portal_->Start()) {
+                ESP_LOGI(TAG, "SD video page: http://%s:8080/",
+                    WifiManager::GetInstance().GetIpAddress().c_str());
+            }
+        } else video_portal_->Stop();
+    }
+
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.sd_video.download",
+            "Download an HTTP(S) baseline MJPEG AVI to the SD card and play it silently. "
+            "Maximum 320x240, 30 fps and 16 MiB. Query self.sd_video.status for completion.",
+            PropertyList({Property("url", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const auto url = properties["url"].value<std::string>();
+                if (!IsSdVideoUrlValid(url)) {
+                    throw std::runtime_error("A valid HTTP(S) AVI URL is required (max 1024 bytes)");
+                }
+                Application::GetInstance().Schedule([this, url]() { EnterMusic(url); });
+                return std::string("Download queued");
+            });
+        mcp_server.AddTool("self.sd_video.status", "Get SD video download and playback status.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue { return VideoStatus(); });
         mcp_server.AddTool("self.system.reconfigure_wifi",
             "End this conversation and enter WiFi configuration mode.\n"
             "**CAUTION** You must ask the user to confirm this action.",
@@ -1027,6 +1108,7 @@ public:
         InitializeCamera();
         InitializeCameraWorker();
         music_player_ = std::make_unique<SdMusicPlayer>(Application::GetInstance().GetAudioService());
+        InitializeVideoPortal();
         InitializeButtons();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
@@ -1046,6 +1128,10 @@ public:
                 if (event == NetworkEvent::Connected) wifi_ready_ = true;
                 else if (event == NetworkEvent::Disconnected || event == NetworkEvent::WifiConfigModeEnter) {
                     wifi_ready_ = false;
+                }
+                if (event == NetworkEvent::Connected || event == NetworkEvent::Disconnected ||
+                    event == NetworkEvent::WifiConfigModeEnter) {
+                    app.Schedule([this]() { UpdateVideoPortal(); });
                 }
                 if (event == NetworkEvent::WifiConfigModeEnter && app_mode_ != AppMode::kMusic) {
                     StopPreview();

@@ -17,6 +17,7 @@ public:
         std::function<void()> rescan;
         std::function<void(int)> volume;
         std::function<int()> get_volume;
+        std::function<std::string()> portal_address;
     };
 
     SdMusicScreen(lv_obj_t* parent, SdMusicPlayer& player, Actions actions);
@@ -31,6 +32,13 @@ private:
     lv_obj_t *back_ = nullptr, *rescan_ = nullptr;
     lv_obj_t *title_ = nullptr, *status_ = nullptr, *counter_ = nullptr, *volume_ = nullptr;
     lv_obj_t *previous_ = nullptr, *toggle_ = nullptr, *next_ = nullptr;
+    lv_obj_t* parent_ = nullptr;
+    lv_obj_t* video_overlay_ = nullptr;
+    lv_obj_t* video_image_ = nullptr;
+    lv_obj_t* video_toggle_ = nullptr;
+    lv_obj_t* help_overlay_ = nullptr;
+    lv_image_dsc_t video_dsc_{};
+    std::shared_ptr<const SdMusicPlayer::VideoFrame> video_frame_;
     SdMusicPlayer::Snapshot last_{};
     int last_volume_ = -1;
     bool initialized_ = false;
@@ -39,4 +47,6 @@ private:
                      const char* text, lv_event_cb_t callback);
     void SetText(lv_obj_t* label, const char* text, const char* fallback);
     void Update(bool force = false);
+    void ShowDownloadHelp();
+    void UpdateVideo(const SdMusicPlayer::Snapshot& snapshot);
 };

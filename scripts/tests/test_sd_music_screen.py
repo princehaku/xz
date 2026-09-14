@@ -56,6 +56,7 @@ static void AssertFontReleased(lv_obj_t* root, const lv_font_t* font) {
 static void AssertBounds(lv_obj_t* root) {
     for (uint32_t i = 0; i < lv_obj_get_child_count(root); ++i) {
         auto* child = lv_obj_get_child(root, i);
+        if (lv_obj_has_flag(child, LV_OBJ_FLAG_HIDDEN)) continue;
         lv_area_t a;
         lv_obj_get_coords(child, &a);
         if (!(a.x1 >= 0 && a.y1 >= 0 && a.x2 < 320 && a.y2 < 240)) {
@@ -64,6 +65,7 @@ static void AssertBounds(lv_obj_t* root) {
             assert(false);
         }
         for (uint32_t j = i + 1; j < lv_obj_get_child_count(root); ++j) {
+            if (lv_obj_has_flag(lv_obj_get_child(root, j), LV_OBJ_FLAG_HIDDEN)) continue;
             lv_area_t b;
             lv_obj_get_coords(lv_obj_get_child(root, j), &b);
             if (!(a.x2 < b.x1 || b.x2 < a.x1 || a.y2 < b.y1 || b.y2 < a.y1)) {
@@ -191,6 +193,7 @@ public:
     std::atomic<bool> wifi_ready_{false};
     std::unique_ptr<SdMusicPlayer> music_player_ = std::make_unique<SdMusicPlayer>();
     std::unique_ptr<SdMusicScreen> music_screen_;
+    void UpdateVideoPortal() {}
     lv_obj_t *home_overlay_ = nullptr, *preview_canvas_ = nullptr, *photo_hint_ = nullptr;
     lv_obj_t *home_chat_button_ = nullptr, *home_camera_button_ = nullptr, *home_status_label_ = nullptr;
     lv_timer_t* home_status_timer_ = nullptr;
@@ -243,11 +246,12 @@ void TestHomeAndCamera() {
     };
     auto force_ai_clicks = [&] {
         const auto generation = board.page_generation_.load();
+        const auto queued = app.queue.size();
         // Bypass normal LVGL disabled-input filtering to exercise both guards.
         lv_obj_send_event(board.home_chat_button_, LV_EVENT_CLICKED, nullptr);
         lv_obj_send_event(board.home_camera_button_, LV_EVENT_CLICKED, nullptr);
         assert(board.app_mode_ == LichuangDevBoardML307::AppMode::kHome);
-        assert(board.page_generation_ == generation && app.queue.empty());
+        assert(board.page_generation_ == generation && app.queue.size() == queued);
     };
     assert_home(false, "Connecting Wi-Fi..."); force_ai_clicks();
     const int cleanups = app.cleanups;
@@ -362,7 +366,15 @@ int main() {
     auto screen = std::make_unique<SdMusicScreen>(root, player, std::move(actions));
     screen->SetFont(std::make_shared<LvglBuiltInFont>(&font_noto_basic_20_4));
     Tick();
-    assert(Find(root, "MP3 / PCM WAV") && Find(root, "Preparing..."));
+    assert(Find(root, "MP3 / PCM WAV / MJPEG AVI") && Find(root, "Preparing..."));
+    const auto media_children = lv_obj_get_child_count(root);
+    Click(root, "Download AVI");
+    Tick();
+    assert(lv_obj_get_child_count(root) == media_children + 1);
+    assert(Find(root, "Connect to Wi-Fi first.\nThen open this page on your phone."));
+    Click(root, "Close");
+    Tick();
+    assert(lv_obj_get_child_count(root) == media_children);
     for (const auto state : {SdMusicPlayer::State::kNoCard, SdMusicPlayer::State::kEmpty,
                              SdMusicPlayer::State::kError, SdMusicPlayer::State::kScanning}) {
         player.snapshot.state = state;
@@ -383,6 +395,40 @@ int main() {
     Tick();
     assert(Find(root, "Paused") || Find(root, "已暂停")); Click(root, "Play", "播放");
     assert(toggles == 2);
+    player.snapshot.state = SdMusicPlayer::State::kDownloading;
+    player.snapshot.download_percent = 73;
+    Tick();
+    assert(Find(root, "Downloading AVI... 73%"));
+    player.snapshot.state = SdMusicPlayer::State::kPlaying;
+    player.snapshot.is_video = true;
+    auto frame = std::make_shared<SdMusicPlayer::VideoFrame>();
+    frame->width = 320; frame->height = 240; frame->stride = 640;
+    frame->pixels.assign(320 * 240 * 2, 0xf8);
+    player.frame = frame;
+    std::weak_ptr<const SdMusicPlayer::VideoFrame> old_frame = frame;
+    frame.reset();
+    Tick();
+    auto* overlay = lv_obj_get_child(root, -1);
+    assert(!lv_obj_has_flag(overlay, LV_OBJ_FLAG_HIDDEN));
+    auto* picture = lv_obj_get_child(overlay, 0);
+    auto* descriptor = static_cast<const lv_image_dsc_t*>(lv_image_get_src(picture));
+    assert(descriptor && descriptor->header.w == 320 && descriptor->data[0] == 0xf8);
+    auto second = std::make_shared<SdMusicPlayer::VideoFrame>(*player.frame);
+    second->pixels.assign(320 * 240 * 2, 0x07);
+    player.frame = second;
+    second.reset();
+    Tick();
+    assert(old_frame.expired());
+    descriptor = static_cast<const lv_image_dsc_t*>(lv_image_get_src(picture));
+    assert(descriptor->data[0] == 0x07);
+    player.snapshot.state = SdMusicPlayer::State::kPaused;
+    Tick();
+    assert(lv_image_get_src(picture) == descriptor && !lv_obj_has_flag(overlay, LV_OBJ_FLAG_HIDDEN));
+    player.frame.reset();
+    player.snapshot.is_video = false;
+    Tick();
+    assert(lv_obj_has_flag(overlay, LV_OBJ_FLAG_HIDDEN));
+    std::cout << "PASS: download progress and RGB565 video replacement/pause/frame lifetime\n";
     player.snapshot.title = "中文歌曲";
     Tick();
     assert(Find(root, "Track 2"));
@@ -520,10 +566,14 @@ def main():
 #define LV_USE_DEMO_WIDGETS 0
 """, encoding="utf-8")
         (directory / "sd_music_player.h").write_text(
-            "#pragma once\n#include <string>\n#include <cstdint>\n"
+            "#pragma once\n#include <string>\n#include <cstdint>\n#include <memory>\n#include <vector>\n"
             "class SdMusicPlayer { public:\n" + state + "\n" + snapshot +
             "\nSnapshot snapshot; int starts = 0, stops = 0;\n"
             "Snapshot GetSnapshot() const { return snapshot; }\n"
+            "struct VideoFrame { std::vector<uint8_t> pixels; uint32_t width=0,height=0,stride=0; };\n"
+            "std::shared_ptr<const VideoFrame> frame;\n"
+            "std::shared_ptr<const VideoFrame> GetVideoFrame() const { return frame; }\n"
+            "bool DownloadVideo(const std::string&) { ++starts; return true; }\n"
             "void Start() { ++starts; } void Stop() { ++stops; }\n};\n", encoding="utf-8")
         for name in ("sd_music_screen.h", "sd_music_screen.cc"):
             shutil.copyfile(BOARD / name, directory / name)

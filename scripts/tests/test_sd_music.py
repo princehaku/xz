@@ -484,7 +484,10 @@ def main():
         binary = directory / "test"
         cpp.write_text(HARNESS + "\n#define private public\n" + header + "\n#undef private\n" +
                        "#define fopen test_fopen\n#define opendir test_opendir\n#define stat(path, info) test_stat(path, info)\n" +
-                       source + "\n#undef fopen\n#undef opendir\n#undef stat\n" + TESTS, encoding="utf-8")
+                       source + "\n#undef fopen\n#undef opendir\n#undef stat\n" +
+                       "bool SdMusicPlayer::DownloadVideoFile(const Command&) { return false; }\n"
+                       "SdMusicPlayer::TrackResult SdMusicPlayer::PlayVideoTrack(const Command&) "
+                       "{ return TrackResult::kBadFile; }\n" + TESTS, encoding="utf-8")
         subprocess.run([os.environ.get("CXX", "g++"), "-std=c++20", "-Wall", "-Wextra", "-Werror",
                         "-Wno-unused-variable", "-g", "-pthread", "-fsanitize=address,undefined",
                         str(cpp), "-o", str(binary)], check=True)
